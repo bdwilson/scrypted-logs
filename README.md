@@ -103,9 +103,14 @@ node scrypted-logs.mjs dump --all > all-consoles.txt
 
 ### `notifications`: what was pushed, to whom, and why not
 
-> **Requires `tail nvr` to be running beforehand.** The report is built from what `tail nvr` saves: the NVR plugin's console (`nvr/plugin.log`) and a history of notification settings (`nvr/notifier-settings.jsonl`). It can only report on periods when that tail was running. Start it once and leave it in the background (see [Run it in the background](#run-it-in-the-background)):
+> **Requires `tail nvr objectdetector` to be running beforehand.** The report is built from what that tail saves:
+> - the NVR plugin's console (`nvr/plugin.log`);
+> - a history of notification settings (`nvr/notifier-settings.jsonl`);
+> - the Object Detection plugin's console (`objectdetector/plugin.log`), which shows what its zones filtered out.
+>
+> `objectdetector` is optional. Without it, everything works except skips caused by Object Detection zones. The report can only cover periods when the tail was running. Start it once and leave it in the background (see [Run it in the background](#run-it-in-the-background)):
 > ```bash
-> node scrypted-logs.mjs tail nvr --quiet
+> node scrypted-logs.mjs tail nvr objectdetector --quiet
 > ```
 > Then run `notifications` whenever you like, in another terminal. If you use `--dir` for the tail, pass the same `--dir` to `notifications`.
 
@@ -135,10 +140,10 @@ node scrypted-logs.mjs notifications "garage front" --since "2026-11-15 15:00"
 
 **How the settings history is recorded.** It's part of the `tail` process. Nothing is installed in or added to Scrypted, and it's designed not to wear your disk. Whenever `nvr` is one of the tail's targets (including `tail --all`), the same process also:
 1. **takes one snapshot at startup** as the baseline. It's a temporary, read-only copy of Scrypted's database (`~/.scrypted/volume/scrypted.db`): the table files are hard-linked and the journal is cloned with APFS copy-on-write, so almost nothing is written. The live database is never opened.
-2. **then only reads.** Every database write lands first in LevelDB's journal file (`000NNN.log`), which Scrypted only ever appends to. The tail watches the database folder, and at most every 0.2 s (plus a 30-second fallback) it reads just the newly appended bytes, picks out writes to NVR notifier devices, and updates its copy of their Default Notifications, Custom Notifications per camera, and notification zones. No snapshots and no disk writes, even when Scrypted is writing hundreds of times a minute; in testing it used about 0.1% CPU.
-3. **appends a line** to `nvr/notifier-settings.jsonl` only when one of those settings changes. `t` is when the write was seen, and `after` is the previous read, so the change happened between the two, usually within about a second.
+2. **then only reads.** Every database write lands first in LevelDB's journal file (`000NNN.log`), which Scrypted only ever appends to. Once a second the tail checks the journal's size, a metadata-only `stat` that writes nothing. When it has grown, the tail reads just the newly appended bytes and picks out writes to NVR's notifier devices and per-user **NVR Preferences** devices. It then updates its copy of each device's Default Notifications, its Custom Notifications per camera, and the **AI, Zones & Schedules** filters. Polling is used because macOS file-change notifications proved unreliable for this file. No snapshots and no disk writes, even when Scrypted is writing hundreds of times a minute; in testing it used about 0.1% CPU or less.
+3. **appends a line** to `nvr/notifier-settings.jsonl` only when one of those settings changes. `t` is when the write was seen, and `after` is the previous read, so the change happened between the two: within about a second.
 
-If a detection falls inside a change's window and the new settings explain why it was skipped, the report uses them and says so. This mainly matters for history recorded by earlier versions, which only checked every 30 seconds. Those changes are shown as "sometime between … and …".
+If a detection falls inside a change's window and the new settings explain why it was skipped, the report uses them and says so. This mainly matters for history recorded by earlier versions, which in practice only caught changes every 30 seconds; those are shown as "sometime between … and …". History from before filters were recorded is explained using today's filters, and the report says so.
 
 That captures changes from the Scrypted UI, from automations or scripts that edit those settings, and from anything else. A notification's Snooze button isn't a setting; it shows up in the NVR log as a `snoozing …` line instead. If the tail stops, recording stops. Without that history, the report explains skips using the **current** settings and says so, which may not match what was set at the time. With no saved NVR log at all, it falls back to the in-memory console, with approximate times. Periods when `tail` wasn't running are invisible.
 
@@ -155,8 +160,16 @@ That captures changes from the Scrypted UI, from automations or scripts that edi
 - **A face was recognized.** NVR then holds back *People* and *Animal* for that camera for a minute and sends *Familiar People* instead. If Familiar People is off on a device, that device gets nothing for the event.
 - **Snoozed.** After an alert, the same camera and type is snoozed for 1 minute. The 10, 30 or 60 minute snooze buttons on a notification do the same for longer.
 - **Summary is on.** If the camera's list includes *Summary*, individual People/Animal/Vehicle alerts are replaced by summaries.
-- **Notification zones.** If the camera has zones, objects outside them are ignored.
-- **Not moving.** Stationary objects without a recognized face aren't notified. NVR doesn't log this, so when a type is on and nothing else explains it, the report says it doesn't know.
+- **AI, Zones & Schedules filters.** Set per camera in the Scrypted app. They're stored on the server, in the user's *NVR Preferences* device, and apply to all of that user's devices unless a device has its own for that camera. NVR checks them before sending, so a detection only notifies if some filter matches all of the following:
+  - it lists the detected type, for example Filter 1 for People/Vehicle and Filter 2 for Animal;
+  - it's within the filter's schedule and days;
+  - if the filter has an **AI description** (such as "dog, cat, deer"), the object matches it. NVR compares the object's CLIP image embedding with the text.
+  - if the filter has a **drawn area**, the object is inside it.
+
+  The report tells you when the type isn't in any filter or the time was outside the schedule. NVR doesn't log AI or area matches, so when only an AI description or area could have let it through, the report says it most likely didn't match. A squirrel against "dog, cat, deer, fox, raccoon" is an example.
+- **Not moving.** NVR only notifies for objects it sees moving, unless they have a recognized face. It logs `[Camera] vehicle is stationary` (or person, or animal), and `Ignoring stationary vehicle`. For vehicles, it also logs `Ignoring vehicle motion due to clipped detection`: NVR couldn't measure the movement, because the vehicle crossed the edge of one of the image tiles it crops for detection, or because there was too much motion in the scene. Either way, NVR treats the vehicle as not moving. The report quotes whichever of these it finds near the event.
+- **Object Detection zones.** These are set on the camera under *Object Detection → Zone: …* and stored in the Video Analysis Plugin. An *exclude* zone removes matching classes, for example vehicles on the road. An *include* zone keeps only what's inside it. This happens before NVR's notifier sees a detection, so nothing is pushed. Every 10 s while a camera is analyzing, the Object Detection console logs a `Detected (filtered)` summary listing what its zones removed. If that console is saved (`tail … objectdetector`), the report names the zone, such as `exclude zone "road"`. NVR's own `retain moving` line still appears for the object, because NVR's tracker runs before the zones are applied.
+- **Unknown.** When a type is on and nothing above explains the skip, the report says it doesn't know.
 
 **How it reads the logs:**
 - **Detections** are NVR's `[Camera] retain moving <track> <class> <score>` and `[Camera] retain label face <name>` lines. Lines for the same camera less than 60 s apart form one event, and people are counted by distinct track ID.

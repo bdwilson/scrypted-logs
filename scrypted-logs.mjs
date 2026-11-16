@@ -119,13 +119,70 @@ function notifierSettings(storage = {}) {
     const custom = {};
     for (const [k, v] of Object.entries(storage))
         if (k.startsWith('custom-notifications-')) custom[k.slice(21)] = json(v, []);
-    const zones = json(storage.cameraNotificationZonesJSON, {});
     return {
         defaultNotifications: json(storage.defaultNotifications, null),
         customCameras: json(storage.customCameras, []),
         custom,
-        zoneCameras: Object.keys(zones).filter(k => Object.keys(zones[k] || {}).length),
+        ownZones: compactZones(json(storage.cameraNotificationZonesJSON, {})),
     };
+}
+
+// "AI, Zones & Schedules" filters: {camId: {filterName: {...}}}. The drawn area's points are
+// reduced to a flag; the rest is kept as NVR uses it.
+function compactZones(zones) {
+    const out = {};
+    for (const [cam, filters] of Object.entries(zones || {})) {
+        out[cam] = {};
+        for (const [name, z] of Object.entries(filters || {})) {
+            const c = {};
+            for (const k of ['classes', 'ai', 'timeRange', 'days', 'timeZone', 'exclusion', 'critical']) if (z?.[k] != null && z[k] !== '') c[k] = z[k];
+            if (z?.path?.length >= 3) c.area = true;
+            out[cam][name] = c;
+        }
+    }
+    return out;
+}
+
+// Object Detection ("Video Analysis Plugin") zones, kept in that plugin's storage as
+// mixin:<camera>:<detector>:zoneInfos. Returns {camId: [{name, mode, classes, type}]}.
+function detectionZones(storage = {}) {
+    const out = {};
+    for (const [k, v] of Object.entries(storage)) {
+        const m = k.match(/^mixin:(\d+):\d+:zoneInfos$/);
+        if (!m) continue;
+        let infos;
+        try { infos = JSON.parse(v); } catch { continue; }
+        for (const [name, z] of Object.entries(infos || {})) {
+            const mode = z?.filterMode || (z?.exclusion ? 'exclude' : 'include');
+            (out[m[1]] ||= []).push({ name, mode, classes: z?.classes?.length ? z.classes : null, type: z?.type || 'Intersect' });
+        }
+    }
+    return out;
+}
+
+// NVR device kinds that hold notification settings: notifiers ("push:<user>:...") and each
+// user's shared preferences ("preferences:<user>"), whose filters apply to all of that user's
+// notifiers unless a notifier has its own for that camera.
+const nvrSettingsDevice = d => {
+    if (d?.pluginId !== '@scrypted/nvr') return null;
+    const m = String(d.nativeId).match(/^(push|preferences):([^:]+)/);
+    return m ? { kind: m[1], user: m[2] } : null;
+};
+
+// raw = {notifiers: {id: {name, user, ...notifierSettings}}, prefs: {user: zones}} -> what the history stores
+function buildSnapshot(raw) {
+    const snap = {};
+    for (const [id, n] of Object.entries(raw.notifiers)) {
+        const { ownZones, user, ...rest } = n;
+        const zones = { ...(raw.prefs[user] || {}), ...ownZones }; // NVR: the notifier's own filters for a camera win
+        snap[id] = { ...rest, zones };
+    }
+    return snap;
+}
+function applyDevice(raw, id, d) {
+    const k = nvrSettingsDevice(d);
+    if (k?.kind === 'push') raw.notifiers[id] = { name: d.state?.name?.value ?? `device ${id}`, user: k.user, ...notifierSettings(d.storage) };
+    else if (k?.kind === 'preferences') { raw.prefs[k.user] = compactZones(JSON.parse(d.storage?.cameraNotificationZonesJSON || '{}')); raw.prefIds[id] = k.user; }
 }
 
 async function readDevices() {
@@ -145,8 +202,8 @@ async function readDevices() {
                 name: d.state?.name?.value ?? '',
                 type: d.state?.type?.value ?? '',
             };
-            if (d.pluginId === '@scrypted/nvr' && String(d.nativeId).startsWith('push:'))
-                dev.notifier = notifierSettings(d.storage);
+            if (nvrSettingsDevice(d)) { dev.nvrSettings = d; }
+            if (d.pluginId === '@scrypted/objectdetector' && d.nativeId == null) dev.detectionZones = detectionZones(d.storage);
             devices.push(dev);
         }
         await db.close();
@@ -367,22 +424,22 @@ const fmtTime = t => new Date(t).toLocaleString('en-US', { month: 'numeric', day
 
 // --- settings history ---
 
-function currentNotifierSnapshot(devices) {
-    const snap = {};
-    for (const d of devices.filter(d => d.notifier)) snap[d.id] = { name: d.name, ...d.notifier };
-    return snap;
+function rawNotifierSettings(devices) {
+    const raw = { notifiers: {}, prefs: {}, prefIds: {} };
+    for (const d of devices.filter(d => d.nvrSettings)) { try { applyDevice(raw, d.id, d.nvrSettings); } catch { } }
+    return raw;
 }
+const currentNotifierSnapshot = devices => buildSnapshot(rawNotifierSettings(devices));
 
-// Runs alongside `tail`: every 30 s, append the notifier settings if they changed.
 // Runs alongside `tail nvr` and records NVR notifier settings changes without writing to disk
 // (apart from the history line itself):
 // - one database snapshot at startup gives the baseline settings;
 // - after that, it only READS the bytes Scrypted appends to the database journal (LevelDB's
 //   000NNN.log, where every write lands first) and picks out writes to notifier devices.
-//   It reacts to file-system notifications (at most every 0.2 s) plus a 30 s fallback.
+//   It checks the journal's size once a second (a metadata-only stat) and reads only new bytes.
 // Each change is appended to nvr/notifier-settings.jsonl with:
 //   t     = when the write was seen
-//   after = the previous read of the journal, so the change happened in (after, t]
+//   after = the previous check (about 1 s earlier), so the change happened in (after, t]
 
 // LevelDB journal reader: 32 KB blocks of [crc u32][len u16][type u8] fragments
 // (1 FULL, 2 FIRST, 3 MIDDLE, 4 LAST) that form write batches:
@@ -461,7 +518,8 @@ async function recordNotifierSettings(outDir, devices) {
     const dbDir = path.join(VOLUME, 'scrypted.db');
 
     // baseline: the snapshot `tail` already took at startup
-    const snap = currentNotifierSnapshot(devices);
+    const raw = rawNotifierSettings(devices);
+    let snap = buildSnapshot(raw);
     const journal = new JournalReader(dbDir);
     journal.seekToEnd();
     const last = loadSettingsHistory(outDir).at(-1);
@@ -474,39 +532,33 @@ async function recordNotifierSettings(outDir, devices) {
     };
     record(Date.now(), Date.now()); // settings may have changed while the tail wasn't running
 
-    let lastRead = Date.now(), firstEvent = 0, timer;
-    const readJournal = () => {
-        timer = undefined;
+    const applyJournal = entries => {
+        for (const { key, value } of entries) {
+            const id = key.match(/^PluginDevice\/(\d+)$/)?.[1];
+            if (!id) continue;
+            if (value === null) { delete raw.notifiers[id]; if (raw.prefIds[id]) delete raw.prefs[raw.prefIds[id]]; continue; }
+            try { applyDevice(raw, id, JSON.parse(value)); } catch { }
+        }
+        snap = buildSnapshot(raw);
+    };
+
+    // Poll the journal's size once a second: a stat only reads file metadata (no disk writes, and
+    // usually not even a disk read). macOS file-change notifications proved unreliable for this file.
+    let lastRead = Date.now(), lastSize = -1, lastFile = null;
+    while (true) {
+        await sleep(1000);
         const now = Date.now();
-        const after = firstEvent ? Math.max(lastRead, firstEvent - 1000) : lastRead;
-        firstEvent = 0;
         try {
-            for (const { key, value } of journal.readNew()) {
-                const id = key.match(/^PluginDevice\/(\d+)$/)?.[1];
-                if (!id) continue;
-                if (value === null) { delete snap[id]; continue; }
-                let d;
-                try { d = JSON.parse(value); } catch { continue; }
-                if (d.pluginId === '@scrypted/nvr' && String(d.nativeId).startsWith('push:'))
-                    snap[id] = { name: d.state?.name?.value ?? `device ${id}`, ...notifierSettings(d.storage) };
+            const cur = journal.current();
+            const size = cur ? fs.statSync(path.join(dbDir, cur)).size : 0;
+            if (cur !== lastFile || size !== lastSize) {
+                lastFile = cur; lastSize = size;
+                applyJournal(journal.readNew());
+                record(now, lastRead);
             }
-            record(now, after);
         }
         catch { }
         lastRead = now;
-    };
-
-    try {
-        fs.watch(dbDir, () => {
-            firstEvent ||= Date.now();
-            timer ??= setTimeout(readJournal, 200); // not reset by later events, so it can't starve
-        });
-    }
-    catch { } // no file-system notifications: the 30 s fallback below still works
-
-    while (true) {
-        await sleep(30000);
-        if (!timer) readJournal();
     }
 }
 
@@ -528,9 +580,53 @@ function typesFor(s, camId) {
 const listOrNone = a => a.length ? [...new Set(a)].join(', ') : 'none';
 const fmtClock = t => new Date(t).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
 
+// Minutes since midnight in a time zone (NVR compares schedule times this way).
+function minutesOfDay(t, tz) {
+    try {
+        const p = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: 'numeric', hour12: false, timeZone: tz || undefined }).formatToParts(new Date(t));
+        return (Number(p.find(x => x.type === 'hour')?.value) % 24) * 60 + Number(p.find(x => x.type === 'minute')?.value);
+    } catch { const d = new Date(t); return d.getHours() * 60 + d.getMinutes(); }
+}
+const fmtHM = (t, tz) => new Date(t).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz || undefined });
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+// Would NVR's "AI, Zones & Schedules" filters let this type through at time t? Mirrors NVR:
+// a filter applies when it is in its schedule/days and lists the type; an AI description must
+// also match the object (CLIP similarity, not logged); a drawn area must contain it (not logged).
+// Returns null when the filters don't stop it, otherwise the reason.
+function filterVerdict(filters, ty, t, detected) {
+    const list = Object.entries(filters || {});
+    if (!list.length || !['People', 'Familiar People', 'Animal', 'Vehicle'].includes(ty)) return null;
+    if (!list.some(([, z]) => !z.exclusion)) return null; // only exclusion filters: NVR doesn't require a match
+    const desc = ([n, z]) => `${n}: ${z.classes ? listOrNone(z.classes) : 'all types'}${z.ai ? `, AI "${z.ai.trim()}"` : ''}${z.area ? ', drawn area' : ''}`;
+    const covers = list.filter(([, z]) => !z.exclusion && (!z.classes || z.classes.includes(ty)));
+    if (!covers.length)
+        return `${ty} isn't in any AI, Zones & Schedules filter for this camera (${list.filter(([, z]) => !z.exclusion).map(desc).join('; ')})`;
+    const offSchedule = [];
+    const active = covers.filter(([n, z]) => {
+        if (z.timeRange?.length === 2) {
+            const [a, b] = z.timeRange.map(x => minutesOfDay(x, z.timeZone)), now = minutesOfDay(t, z.timeZone);
+            if (!(a <= b ? now >= a && now < b : now >= a || now < b)) { offSchedule.push(`${n} runs ${fmtHM(z.timeRange[0], z.timeZone)}–${fmtHM(z.timeRange[1], z.timeZone)}`); return false; }
+        }
+        if (z.days?.length) {
+            const day = new Date(new Date(t).toLocaleString('en-US', { timeZone: z.timeZone || undefined })).getDay();
+            if (!z.days.includes(day)) { offSchedule.push(`${n} runs ${z.days.map(d => DAY_NAMES[d]).join(', ')}`); return false; }
+        }
+        return true;
+    });
+    if (!active.length) return `outside the schedule of the AI, Zones & Schedules filters for ${ty} (${offSchedule.join('; ')})`;
+    if (active.some(([, z]) => !z.ai && !z.area)) return null; // a plain filter lets it through
+    const ai = active.filter(([, z]) => z.ai), area = active.filter(([, z]) => z.area && !z.ai);
+    const bits = [];
+    if (ai.length) bits.push(`only when it matches the AI description ${ai.map(([n, z]) => `"${z.ai.trim()}" (${n})`).join(' or ')}`);
+    if (area.length) bits.push(`only inside the drawn area of ${area.map(([n]) => n).join(', ')}`);
+    const what = detected?.length ? `this ${listOrNone(detected)}` : 'this detection';
+    return `AI, Zones & Schedules: ${ty} notifies ${bits.join(', or ')}; NVR doesn't log the match, so ${what} most likely didn't match`;
+}
+
 // Why a notifier (settings s) would skip a detection of these types on this camera.
 // unknown = true when the settings allow it and nothing in the logs explains the skip.
-function explainNotifier(s, camId, types, snoozedTypes, faceSeen) {
+function explainNotifier(s, camId, types, snoozedTypes, faceSeen, t = Date.now(), detected = [], evidence = null) {
     const { types: enabled, source } = typesFor(s, camId);
     const off = [...types].filter(ty => !enabled.includes(ty));
     const offText = off.length ? `${off.join(', ')} ${off.length > 1 ? 'are' : 'is'} off (${source}: ${listOrNone(enabled)})` : '';
@@ -553,10 +649,25 @@ function explainNotifier(s, camId, types, snoozedTypes, faceSeen) {
     const rest = wanted.filter(ty => !snoozed.includes(ty));
     let unknown = false;
     if (rest.length) {
-        if (s.zoneCameras?.includes(camId)) bits.push(`${rest.join(', ')} on, but the camera has notification zones; it may have been outside them`);
-        else {
+        const filtered = [], open = [];
+        for (const ty of rest) {
+            const v = s.zones ? filterVerdict(s.zones[camId], ty, t, detected) : null;
+            if (v) { filtered.push(ty); if (!bits.includes(v)) bits.push(v); } else open.push(ty);
+        }
+        if (filtered.length && s.zonesNow) bits[bits.length - 1] += ' (filters as they are now: older history didn\'t record them)';
+        // what the logs show about the rest: removed by an Object Detection zone, or not moving
+        const unexplained = [];
+        for (const ty of open) {
+            const found = evidence?.reasons(ty) ?? [];
+            if (!found.length) unexplained.push(ty);
+            for (const w of found) if (!bits.includes(w)) bits.push(w);
+        }
+        if (unexplained.length) {
             unknown = true;
-            bits.push(`${rest.join(', ')} ${rest.length > 1 ? 'are' : 'is'} on, but NVR didn't send (it doesn't log why: usually a stationary object, or the setting was different at the time)`);
+            if (!s.zones && s.zoneCameras?.includes(camId)) // history from before filters were recorded
+                bits.push(`${unexplained.join(', ')} on, but the camera has notification zones; it may have been outside them`);
+            else
+                bits.push(`${unexplained.join(', ')} ${unexplained.length > 1 ? 'are' : 'is'} on, but NVR didn't send (it doesn't log why: usually a stationary object, or the setting was different at the time)`);
         }
     }
     const why = bits.join('; ') || `nothing detected that this device is set to notify for (${source}: ${listOrNone(enabled)})`;
@@ -578,6 +689,13 @@ function settingsChanges(prev, next, camName) {
             const desc = x => x.source.startsWith('custom') ? `custom notifications: ${listOrNone(x.types)}` : 'default notifications';
             out.push({ notifier: n.name, camera: camName(c), text: `${desc(b)} (was ${desc(a)})` });
         }
+        if (p.zones && n.zones)
+            for (const c of new Set([...Object.keys(p.zones), ...Object.keys(n.zones)])) {
+                const a = p.zones[c] || {}, b = n.zones[c] || {};
+                if (JSON.stringify(a) === JSON.stringify(b)) continue;
+                const d = f => Object.entries(f).map(([k, z]) => `${k}${z.exclusion ? ' (exclude)' : ''}: ${z.classes ? listOrNone(z.classes) : 'all'}${z.ai ? ` AI "${z.ai.trim()}"` : ''}${z.area ? ' area' : ''}${z.timeRange || z.days?.length ? ' scheduled' : ''}`).join('; ') || 'none';
+                out.push({ notifier: n.name, camera: camName(c), text: `AI, Zones & Schedules filters: ${d(b)} (was ${d(a)})` });
+            }
     }
     return out;
 }
@@ -597,7 +715,8 @@ async function notificationsReport({ outDir, since, until, cameraFilter }) {
         let s = null;
         for (const h of history) if (h.t <= t) s = h.notifiers; else break;
         if (!s) { usedCurrent = true; return current; }
-        return s;
+        return Object.fromEntries(Object.entries(s).map(([id, n]) =>
+            [id, n.zones || !current[id] ? n : { ...n, zones: current[id].zones, zonesNow: true }]));
     };
 
     // NVR lines: saved file (exact times) or, failing that, memory (approximate times)
@@ -606,7 +725,7 @@ async function notificationsReport({ outDir, since, until, cameraFilter }) {
     if (!nvr) { nvr = await loadMemoryLines('@scrypted/nvr', null, ports); approxNvr = true; }
 
     const inRange = l => l.t >= since && l.t <= until;
-    const events = [], open = new Map(), pushes = [], snoozes = [], errors = [];
+    const events = [], open = new Map(), pushes = [], snoozes = [], errors = [], still = [];
     for (const l of nvr.filter(inRange)) {
         let m = l.text.match(/^\[(.+?)\] retain (?:moving (\S+) (\S+) [\d.]+|label (\S+) (.+))/);
         if (m) {
@@ -630,11 +749,56 @@ async function notificationsReport({ outDir, since, until, cameraFilter }) {
                 subtitle: j.subtitle, to: j.data?.actionUrl?.split('/').pop(), silent: !!j.silent, used: false });
             continue;
         }
+        // NVR's movement check: objects it doesn't consider moving are never notified
+        m = l.text.match(/^\[(.+?)\] (?:(\S+) is stationary|Ignoring stationary (vehicle)|Ignoring (vehicle) motion due to (clipped) detection)/);
+        if (m) { still.push({ t: l.t, camera: m[1], cls: m[2] || m[3] || m[4], clipped: !!m[5] }); continue; }
         // NVR's own lines only ("[Other Plugin] snoozing ..." comes from other notifiers)
         m = l.text.match(/^snoozing nvr-(\d+)-(.+)-(true|false) for (\d+) minutes/);
         if (m) { snoozes.push({ t: l.t, camId: m[1], type: m[2], minutes: Number(m[4]) }); continue; }
         if (/push error|"failureCount":[1-9]/.test(l.text)) errors.push(l);
     }
+
+    // Object Detection's 10-second summaries: "[Camera] [12.5s] Detected (filtered)  : vehicle (0.93)"
+    // list the classes its zones removed before NVR's notifier saw them. Only in a saved log
+    // (`tail objectdetector`): in memory these lines have no usable times.
+    const odLines = loadFileLines(path.join(outDir, 'objectdetector', 'plugin.log'));
+    const filteredSummaries = [];
+    for (const l of odLines ?? []) {
+        const m = l.text.match(/^\[(.+?)\] \[[\d.]+s\] Detected \(filtered\)\s*: (.*)$/);
+        if (m && !m[2].includes('[no detections]'))
+            filteredSummaries.push({ t: l.t, camera: m[1], classes: [...m[2].matchAll(/(\S+) \(/g)].map(x => x[1]) });
+    }
+    const zonesByCam = Object.assign({}, ...devices.filter(d => d.detectionZones).map(d => d.detectionZones));
+    let needOd = false;
+
+    // per event: what the logs say happened to each notification type
+    const evidenceFor = ev => {
+        const near = x => x.camera === ev.camera;
+        const odCovers = odLines?.length && odLines[0].t <= ev.start && odLines.at(-1).t >= ev.end;
+        const stillHere = still.filter(x => near(x) && x.t >= ev.start - 1000 && x.t <= ev.end + 12000);
+        // a summary at time T covers the 10 s before it
+        const removed = new Set(filteredSummaries.filter(x => near(x) && x.t >= ev.start && x.t - 10500 <= ev.end).flatMap(x => x.classes));
+        const zoneText = cls => {
+            const zs = (zonesByCam[ev.camId] || []).filter(z => z.mode !== 'observe' && (!z.classes || z.classes.includes(cls)));
+            const ex = zs.filter(z => z.mode === 'exclude').map(z => `"${z.name}"`), inc = zs.filter(z => z.mode !== 'exclude').map(z => `"${z.name}"`);
+            if (ex.length) return `exclude zone ${ex.join(' or ')}`;
+            if (inc.length) return `it was outside include zone ${inc.join(' or ')}`;
+            return 'a zone';
+        };
+        return {
+            any: stillHere.length > 0 || removed.size > 0,
+            reasons(ty) {
+                const out = [];
+                for (const cls of removed) if (TYPE_OF_CLASS(cls) === ty) out.push(`Object Detection removed a ${cls} (${zoneText(cls)}), so NVR never got it`);
+                const st = stillHere.filter(x => TYPE_OF_CLASS(x.cls) === ty);
+                if (st.some(x => x.clipped))
+                    out.push(`NVR couldn't measure the ${st[0].cls}'s movement (it logged "clipped detection": the object crossed the edge of a detection tile, or there was too much motion) and doesn't notify for objects it doesn't see moving`);
+                else if (st.length) out.push(`NVR logged "${st[0].cls} is stationary" and doesn't notify for objects that aren't moving`);
+                if (!odCovers && ['Vehicle', 'People', 'Animal'].includes(ty)) needOd = true;
+                return out;
+            },
+        };
+    };
 
     const rows = []; // {t, kind: 'event'|'settings'|'error', ...}
 
@@ -654,6 +818,8 @@ async function notificationsReport({ outDir, since, until, cameraFilter }) {
         // snoozes from an earlier alert still running when this event began
         const snoozedTypes = new Set(snoozes.filter(s => s.camId === ev.camId && s.t < ev.start && s.t >= ev.start - s.minutes * 60000).map(s => s.type));
         const faceSeen = types.has('Familiar People');
+        const detected = [...ev.tracks.keys()];
+        const evidence = evidenceFor(ev);
 
         // a settings change whose uncertainty window (after, t] contains this detection
         const straddling = history.filter(h => h.after < ev.start && ev.start <= h.t).at(-1);
@@ -661,7 +827,7 @@ async function notificationsReport({ outDir, since, until, cameraFilter }) {
         const recipients = [];
         for (const [nid, s] of Object.entries(settings)) {
             const got = evPushes.filter(p => p.to === nid);
-            const old = explainNotifier(s, ev.camId, types, snoozedTypes, faceSeen);
+            const old = explainNotifier(s, ev.camId, types, snoozedTypes, faceSeen, ev.start, detected, evidence);
             if (got.length) {
                 const subs = [...new Set(got.map(p => `"${p.subtitle}"`))].join(", ");
                 recipients.push({ status: "sent", name: s.name, text: subs + (old.offText ? `; ${old.offText}` : "") });
@@ -671,7 +837,7 @@ async function notificationsReport({ outDir, since, until, cameraFilter }) {
             // the change may have landed just before this detection: prefer the new settings if they explain the skip
             const ns = straddling?.notifiers?.[nid];
             if (old.unknown && ns) {
-                const nu = explainNotifier(ns, ev.camId, types, snoozedTypes, faceSeen);
+                const nu = explainNotifier(ns, ev.camId, types, snoozedTypes, faceSeen, ev.start, detected, evidence);
                 if (!nu.unknown)
                     why = `${nu.why} (settings changed between ${fmtClock(straddling.after)} and ${fmtClock(straddling.t)}; this detection falls in that window)`;
             }
@@ -737,6 +903,7 @@ async function notificationsReport({ outDir, since, until, cameraFilter }) {
     if (usedCurrent) notes.push(history.length
         ? `Settings before ${fmtTime(history[0].t)} weren't recorded, so skip reasons before then use the current settings and may not match what was set at the time.`
         : 'Notification settings history isn\'t recorded yet (it starts when you run `tail nvr`), so skip reasons use the current settings and may not match what was set at the time.');
+    if (needOd) notes.push('Object Detection log not saved for some of these events, so skips caused by its zones can\'t be shown for them. Run `tail nvr objectdetector` to include them.');
     console.error('\n' + notes.join('\n'));
 }
 
@@ -833,8 +1000,8 @@ else {
   node scrypted-logs.mjs grep <regex> [plugin|device ...] [-i] [-C n]   search in-memory consoles (default: all)
   node scrypted-logs.mjs dump <plugin|device ...|--all>                print in-memory consoles once
   node scrypted-logs.mjs notifications [camera] [--since 15:50] [--until 16:30] [--dir <path>]
-    which NVR pushes were sent or skipped per device, and why. Needs \`tail nvr\` running beforehand
-    (it saves nvr/plugin.log and records notification settings changes); otherwise only Scrypted's
-    in-memory console is used, with approximate times and the current settings.
+    which NVR pushes were sent or skipped per device, and why. Needs \`tail nvr objectdetector\` running
+    beforehand: it saves both consoles and records notification settings changes. Without it, only
+    the in-memory NVR console is used, with approximate times and the current settings.
 plugins match by id or short name (hikvision, @scrypted/nvr); devices by name, substring, id, or nativeId.`);
 }
