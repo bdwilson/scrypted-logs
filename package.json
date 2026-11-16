@@ -1,8 +1,0 @@
-{
-  "name": "scrypted-logs",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@scrypted/client": "^1.3.26"
-  }
-}

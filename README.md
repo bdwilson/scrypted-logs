@@ -133,10 +133,12 @@ node scrypted-logs.mjs notifications --since 15:50 --until 16:30      # a window
 node scrypted-logs.mjs notifications "garage front" --since "2026-11-15 15:00"
 ```
 
-**How the settings history is recorded.** It's part of the `tail` process. Nothing is installed in or added to Scrypted. Whenever `nvr` is one of the tail's targets (including `tail --all`), the same process also, every 30 seconds:
-1. takes a read-only snapshot of Scrypted's database (`~/.scrypted/volume/scrypted.db`) in a temp folder. LevelDB's table files never change after they're written, so they're hard-linked rather than copied; this takes about 20 ms and no extra disk space. The live database is never opened.
-2. reads each NVR notifier device's notification settings: Default Notifications, Custom Notifications per camera, and notification zones;
-3. appends a line to `nvr/notifier-settings.jsonl`, but only if something changed.
+**How the settings history is recorded.** It's part of the `tail` process. Nothing is installed in or added to Scrypted, and it's designed not to wear your disk. Whenever `nvr` is one of the tail's targets (including `tail --all`), the same process also:
+1. **takes one snapshot at startup** as the baseline. It's a temporary, read-only copy of Scrypted's database (`~/.scrypted/volume/scrypted.db`): the table files are hard-linked and the journal is cloned with APFS copy-on-write, so almost nothing is written. The live database is never opened.
+2. **then only reads.** Every database write lands first in LevelDB's journal file (`000NNN.log`), which Scrypted only ever appends to. The tail watches the database folder, and at most every 0.2 s (plus a 30-second fallback) it reads just the newly appended bytes, picks out writes to NVR notifier devices, and updates its copy of their Default Notifications, Custom Notifications per camera, and notification zones. No snapshots and no disk writes, even when Scrypted is writing hundreds of times a minute; in testing it used about 0.1% CPU.
+3. **appends a line** to `nvr/notifier-settings.jsonl` only when one of those settings changes. `t` is when the write was seen, and `after` is the previous read, so the change happened between the two, usually within about a second.
+
+If a detection falls inside a change's window and the new settings explain why it was skipped, the report uses them and says so. This mainly matters for history recorded by earlier versions, which only checked every 30 seconds. Those changes are shown as "sometime between … and …".
 
 That captures changes from the Scrypted UI, from automations or scripts that edit those settings, and from anything else. A notification's Snooze button isn't a setting; it shows up in the NVR log as a `snoozing …` line instead. If the tail stops, recording stops. Without that history, the report explains skips using the **current** settings and says so, which may not match what was set at the time. With no saved NVR log at all, it falls back to the in-memory console, with approximate times. Periods when `tail` wasn't running are invisible.
 
@@ -161,16 +163,6 @@ That captures changes from the Scrypted UI, from automations or scripts that edi
 - **Pushes** are NVR's `sending encrypted push {…}` lines. `title` is the camera, `subtitle` is the text, and `data.actionUrl` ends with the receiving device's Scrypted ID. Each alert normally goes out as text first, then a silent update with the snapshot (the iPhone app gets one push with the image); these are grouped. A push for the same camera from 5 s before the event to 30 s after it counts toward that event.
 - **Snoozes** are NVR's `snoozing nvr-<camera>-<type>-… for N minutes` lines.
 - **Not covered:** pushes from Advanced Notifier, HomeKit and other plugins. This only reports Scrypted NVR's own notifiers.
-
-### `migrate`: move logs from the old naming
-
-Earlier versions wrote flat files like `Garage Front [72].log` and `plugin @scrypted_nvr.log`. This moves them into the folder layout above. It's a dry run unless you add `--yes`. If a new-layout file already exists, the old history is put in front of it.
-```bash
-node scrypted-logs.mjs migrate
-```
-```bash
-node scrypted-logs.mjs migrate --yes
-```
 
 ### Naming targets
 
@@ -284,9 +276,3 @@ Because ports are looked up by plugin ID each time, the tool survives port chang
   - [HomeKit troubleshooting](https://docs.scrypted.app/homekit-troubleshooting.html) · [Remote access](https://docs.scrypted.app/maintenance/access.html) · [Cluster](https://docs.scrypted.app/maintenance/cluster.html)
 - Source code: <https://github.com/koush/scrypted>. Console server: [`server/src/plugin/plugin-console.ts`](https://github.com/koush/scrypted/blob/main/server/src/plugin/plugin-console.ts). Cloud plugin: [`plugins/cloud`](https://github.com/koush/scrypted/tree/main/plugins/cloud)
 - Community Discord: <https://discord.gg/DcFzmBHYGq>
-
----
-
-## Legacy script
-
-`tail-consoles.mjs` is the earlier approach. It logs in with `@scrypted/client` and uses the Core plugin's console service. It needs `npm install` (see `package.json`) and a one-time `npx scrypted login 127.0.0.1`. `scrypted-logs.mjs` replaces it. You can delete `tail-consoles.mjs`, `package.json` and any `node_modules` if you don't need it.

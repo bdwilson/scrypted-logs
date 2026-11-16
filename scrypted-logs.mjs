@@ -95,13 +95,20 @@ async function discoverPorts() {
 }
 
 // Snapshot the DB so we never touch the live, locked one. LevelDB's .ldb table files are
-// immutable, so they're hard-linked (instant, no extra space); the rest is copied.
+// immutable, so they're hard-linked (instant, no extra space). The rest, mainly the journal
+// (up to ~4 MB), is cloned with APFS copy-on-write (`cp -c`), which writes no data, so frequent
+// snapshots don't wear the disk; plain copy is the fallback on other filesystems.
+let canClone = process.platform === 'darwin';
 function snapshotDb(dest) {
     const src = path.join(VOLUME, 'scrypted.db');
     for (const f of fs.readdirSync(src)) {
         if (f === 'LOCK') continue;
         const s = path.join(src, f), d = path.join(dest, f);
         if (f.endsWith('.ldb')) { try { fs.linkSync(s, d); continue; } catch { } }
+        if (canClone) {
+            try { execFileSync('/bin/cp', ['-c', s, d], { stdio: 'ignore' }); continue; }
+            catch { if (!fs.existsSync(s)) continue; canClone = false; } // gone mid-snapshot, or no clone support
+        }
         try { fs.copyFileSync(s, d); } catch (e) { if (e.code !== 'ENOENT') throw e; } // compaction may remove files mid-copy
     }
 }
@@ -367,22 +374,139 @@ function currentNotifierSnapshot(devices) {
 }
 
 // Runs alongside `tail`: every 30 s, append the notifier settings if they changed.
-async function recordNotifierSettings(outDir) {
-    const file = path.join(outDir, SETTINGS_FILE);
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    let last = loadSettingsHistory(outDir).at(-1);
-    let lastJson = last ? JSON.stringify(last.notifiers) : '';
-    while (true) {
-        try {
-            const snap = currentNotifierSnapshot(await readDevices());
-            const json = JSON.stringify(snap);
-            if (Object.keys(snap).length && json !== lastJson) {
-                fs.appendFileSync(file, JSON.stringify({ t: new Date().toISOString(), notifiers: snap }) + '\n', { mode: 0o600 });
-                lastJson = json;
+// Runs alongside `tail nvr` and records NVR notifier settings changes without writing to disk
+// (apart from the history line itself):
+// - one database snapshot at startup gives the baseline settings;
+// - after that, it only READS the bytes Scrypted appends to the database journal (LevelDB's
+//   000NNN.log, where every write lands first) and picks out writes to notifier devices.
+//   It reacts to file-system notifications (at most every 0.2 s) plus a 30 s fallback.
+// Each change is appended to nvr/notifier-settings.jsonl with:
+//   t     = when the write was seen
+//   after = the previous read of the journal, so the change happened in (after, t]
+
+// LevelDB journal reader: 32 KB blocks of [crc u32][len u16][type u8] fragments
+// (1 FULL, 2 FIRST, 3 MIDDLE, 4 LAST) that form write batches:
+// [sequence u64][count u32] then [tag u8: 1 put, 0 delete][varint keyLen][key][varint valLen][value]
+class JournalReader {
+    constructor(dir) { this.dir = dir; this.file = null; this.offset = 0; }
+    current() { return fs.readdirSync(this.dir).filter(f => /^\d+\.log$/.test(f)).sort().at(-1) ?? null; }
+    // start at the end of the current journal: everything before is in the baseline snapshot
+    seekToEnd() { this.file = this.current(); this.offset = this.file ? fs.statSync(path.join(this.dir, this.file)).size : 0; }
+    // returns [{key, value|null}] for complete batches appended since the last call
+    readNew() {
+        const out = [];
+        const latest = this.current();
+        if (this.file && latest !== this.file) { // journal rotated: finish the old one, then start the new one
+            try { out.push(...this.#read(this.file)); } catch { }
+            this.file = latest;
+            this.offset = 0;
+        }
+        if (!this.file) { this.file = latest; this.offset = 0; }
+        if (this.file) out.push(...this.#read(this.file));
+        return out;
+    }
+    #read(name) {
+        const p = path.join(this.dir, name);
+        const size = fs.statSync(p).size;
+        if (size <= this.offset) return [];
+        const fd = fs.openSync(p, 'r');
+        const buf = Buffer.alloc(size - this.offset);
+        try { fs.readSync(fd, buf, 0, buf.length, this.offset); } finally { fs.closeSync(fd); }
+        const entries = [];
+        let pos = 0, frags = [], batchStart = 0;
+        while (true) {
+            const abs = this.offset + pos;
+            const left = 32768 - (abs % 32768);
+            if (left < 7) { if (pos + left > buf.length) break; pos += left; continue; } // block trailer
+            if (pos + 7 > buf.length) break;
+            const len = buf.readUInt16LE(pos + 4), type = buf[pos + 6];
+            if (type === 0 && len === 0) { if (pos + left > buf.length) break; pos += left; continue; } // padding
+            if (pos + 7 + len > buf.length) break; // incomplete: wait for more
+            if (type === 1 || type === 2) { frags = []; batchStart = pos; }
+            frags.push(buf.subarray(pos + 7, pos + 7 + len));
+            pos += 7 + len;
+            if (type === 1 || type === 4) {
+                entries.push(...JournalReader.#batch(Buffer.concat(frags)));
+                frags = [];
+                batchStart = pos;
             }
         }
+        this.offset += batchStart; // resume at the first incomplete batch
+        return entries;
+    }
+    static #batch(b) {
+        const varint = o => { let r = 0, s = 0, x; do { x = b[o++]; r |= (x & 0x7f) << s; s += 7; } while (x & 0x80); return [r >>> 0, o]; };
+        const out = [];
+        try {
+            let o = 12;
+            for (let n = b.readUInt32LE(8); n > 0; n--) {
+                const tag = b[o++];
+                let len;
+                [len, o] = varint(o);
+                const key = b.subarray(o, o + len).toString();
+                o += len;
+                let value = null;
+                if (tag === 1) { [len, o] = varint(o); value = b.subarray(o, o + len).toString(); o += len; }
+                out.push({ key, value });
+            }
+        }
+        catch { } // a damaged batch is skipped; the next good one still counts
+        return out;
+    }
+}
+
+async function recordNotifierSettings(outDir, devices) {
+    const file = path.join(outDir, SETTINGS_FILE);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const dbDir = path.join(VOLUME, 'scrypted.db');
+
+    // baseline: the snapshot `tail` already took at startup
+    const snap = currentNotifierSnapshot(devices);
+    const journal = new JournalReader(dbDir);
+    journal.seekToEnd();
+    const last = loadSettingsHistory(outDir).at(-1);
+    let lastJson = last ? JSON.stringify(last.notifiers) : '';
+    const record = (t, after) => {
+        const json = JSON.stringify(snap);
+        if (!Object.keys(snap).length || json === lastJson) return;
+        fs.appendFileSync(file, JSON.stringify({ t: new Date(t).toISOString(), after: new Date(after).toISOString(), notifiers: snap }) + '\n', { mode: 0o600 });
+        lastJson = json;
+    };
+    record(Date.now(), Date.now()); // settings may have changed while the tail wasn't running
+
+    let lastRead = Date.now(), firstEvent = 0, timer;
+    const readJournal = () => {
+        timer = undefined;
+        const now = Date.now();
+        const after = firstEvent ? Math.max(lastRead, firstEvent - 1000) : lastRead;
+        firstEvent = 0;
+        try {
+            for (const { key, value } of journal.readNew()) {
+                const id = key.match(/^PluginDevice\/(\d+)$/)?.[1];
+                if (!id) continue;
+                if (value === null) { delete snap[id]; continue; }
+                let d;
+                try { d = JSON.parse(value); } catch { continue; }
+                if (d.pluginId === '@scrypted/nvr' && String(d.nativeId).startsWith('push:'))
+                    snap[id] = { name: d.state?.name?.value ?? `device ${id}`, ...notifierSettings(d.storage) };
+            }
+            record(now, after);
+        }
         catch { }
+        lastRead = now;
+    };
+
+    try {
+        fs.watch(dbDir, () => {
+            firstEvent ||= Date.now();
+            timer ??= setTimeout(readJournal, 200); // not reset by later events, so it can't starve
+        });
+    }
+    catch { } // no file-system notifications: the 30 s fallback below still works
+
+    while (true) {
         await sleep(30000);
+        if (!timer) readJournal();
     }
 }
 
@@ -390,7 +514,8 @@ function loadSettingsHistory(outDir) {
     const file = path.join(outDir, SETTINGS_FILE);
     if (!fs.existsSync(file)) return [];
     return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean)
-        .map(l => { try { const j = JSON.parse(l); return { t: Date.parse(j.t), notifiers: j.notifiers }; } catch { return null; } })
+        // entries from before "after" was recorded came from a 30 s poll
+        .map(l => { try { const j = JSON.parse(l); const t = Date.parse(j.t); return { t, after: j.after ? Date.parse(j.after) : t - 30000, notifiers: j.notifiers }; } catch { return null; } })
         .filter(Boolean).sort((a, b) => a.t - b.t);
 }
 
@@ -401,6 +526,42 @@ function typesFor(s, camId) {
 }
 
 const listOrNone = a => a.length ? [...new Set(a)].join(', ') : 'none';
+const fmtClock = t => new Date(t).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+
+// Why a notifier (settings s) would skip a detection of these types on this camera.
+// unknown = true when the settings allow it and nothing in the logs explains the skip.
+function explainNotifier(s, camId, types, snoozedTypes, faceSeen) {
+    const { types: enabled, source } = typesFor(s, camId);
+    const off = [...types].filter(ty => !enabled.includes(ty));
+    const offText = off.length ? `${off.join(', ')} ${off.length > 1 ? 'are' : 'is'} off (${source}: ${listOrNone(enabled)})` : '';
+    let wanted = [...types].filter(ty => enabled.includes(ty));
+    const bits = [];
+    if (offText) bits.push(offText);
+    // a recognized face makes NVR hold back People and Animal for a minute in favour of Familiar People
+    const heldBack = faceSeen ? wanted.filter(ty => ty === 'People' || ty === 'Animal') : [];
+    if (heldBack.length) {
+        wanted = wanted.filter(ty => !heldBack.includes(ty));
+        if (!enabled.includes('Familiar People'))
+            bits.push(`a face was recognized, so NVR held back ${heldBack.join(' and ')} for Familiar People, which is off here`);
+    }
+    if (enabled.includes('Summary') && wanted.some(ty => ['People', 'Familiar People', 'Animal', 'Vehicle'].includes(ty))) {
+        bits.push('Summary notifications are on for this camera, which replaces individual alerts');
+        wanted = wanted.filter(ty => !['People', 'Familiar People', 'Animal', 'Vehicle'].includes(ty));
+    }
+    const snoozed = wanted.filter(ty => snoozedTypes.has(ty));
+    if (snoozed.length) bits.push(`${snoozed.join(', ')} still snoozed from an alert just before`);
+    const rest = wanted.filter(ty => !snoozed.includes(ty));
+    let unknown = false;
+    if (rest.length) {
+        if (s.zoneCameras?.includes(camId)) bits.push(`${rest.join(', ')} on, but the camera has notification zones; it may have been outside them`);
+        else {
+            unknown = true;
+            bits.push(`${rest.join(', ')} ${rest.length > 1 ? 'are' : 'is'} on, but NVR didn't send (it doesn't log why: usually a stationary object, or the setting was different at the time)`);
+        }
+    }
+    const why = bits.join('; ') || `nothing detected that this device is set to notify for (${source}: ${listOrNone(enabled)})`;
+    return { why, offText, unknown };
+}
 
 // Human-readable changes between two settings snapshots.
 function settingsChanges(prev, next, camName) {
@@ -494,43 +655,27 @@ async function notificationsReport({ outDir, since, until, cameraFilter }) {
         const snoozedTypes = new Set(snoozes.filter(s => s.camId === ev.camId && s.t < ev.start && s.t >= ev.start - s.minutes * 60000).map(s => s.type));
         const faceSeen = types.has('Familiar People');
 
+        // a settings change whose uncertainty window (after, t] contains this detection
+        const straddling = history.filter(h => h.after < ev.start && ev.start <= h.t).at(-1);
+
         const recipients = [];
         for (const [nid, s] of Object.entries(settings)) {
             const got = evPushes.filter(p => p.to === nid);
-            const { types: enabled, source } = typesFor(s, ev.camId);
-            const notes = [];
-            for (const ty of types) {
-                if (!enabled.includes(ty)) notes.push({ ty, why: 'off' });
-                else if (['People', 'Familiar People', 'Animal', 'Vehicle'].includes(ty) && enabled.includes('Summary')) notes.push({ ty, why: 'summary' });
-            }
-            const off = notes.filter(n => n.why === 'off').map(n => n.ty);
-            const offText = off.length ? `${off.join(', ')} ${off.length > 1 ? 'are' : 'is'} off (${source}: ${listOrNone(enabled)})` : '';
+            const old = explainNotifier(s, ev.camId, types, snoozedTypes, faceSeen);
             if (got.length) {
-                const subs = [...new Set(got.map(p => `"${p.subtitle}"`))].join(', ');
-                recipients.push({ status: 'sent', name: s.name, text: subs + (offText ? `; ${offText}` : '') });
+                const subs = [...new Set(got.map(p => `"${p.subtitle}"`))].join(", ");
+                recipients.push({ status: "sent", name: s.name, text: subs + (old.offText ? `; ${old.offText}` : "") });
                 continue;
             }
-            // not sent: explain
-            let wanted = [...types].filter(ty => enabled.includes(ty));
-            const bits = [];
-            if (offText) bits.push(offText);
-            // a recognized face makes NVR hold back People and Animal for a minute in favour of Familiar People
-            const heldBack = faceSeen ? wanted.filter(ty => ty === 'People' || ty === 'Animal') : [];
-            if (heldBack.length) {
-                wanted = wanted.filter(ty => !heldBack.includes(ty));
-                if (!enabled.includes('Familiar People'))
-                    bits.push(`a face was recognized, so NVR held back ${heldBack.join(' and ')} for Familiar People, which is off here`);
+            let { why } = old;
+            // the change may have landed just before this detection: prefer the new settings if they explain the skip
+            const ns = straddling?.notifiers?.[nid];
+            if (old.unknown && ns) {
+                const nu = explainNotifier(ns, ev.camId, types, snoozedTypes, faceSeen);
+                if (!nu.unknown)
+                    why = `${nu.why} (settings changed between ${fmtClock(straddling.after)} and ${fmtClock(straddling.t)}; this detection falls in that window)`;
             }
-            if (notes.some(n => n.why === 'summary')) bits.push('Summary notifications are on for this camera, which replaces individual alerts');
-            const snoozed = wanted.filter(ty => snoozedTypes.has(ty));
-            if (snoozed.length) bits.push(`${snoozed.join(', ')} still snoozed from an alert just before`);
-            const rest = wanted.filter(ty => !snoozed.includes(ty));
-            if (rest.length) {
-                if (s.zoneCameras?.includes(ev.camId)) bits.push(`${rest.join(', ')} on, but the camera has notification zones; it may have been outside them`);
-                else bits.push(`${rest.join(', ')} ${rest.length > 1 ? 'are' : 'is'} on, but NVR didn't send (it doesn't log why: usually a stationary object, or the setting was different at the time)`);
-            }
-            const why = bits.join('; ') || `nothing detected that this device is set to notify for (${source}: ${listOrNone(enabled)})`;
-            recipients.push({ status: 'skipped', name: s.name, text: why });
+            recipients.push({ status: "skipped", name: s.name, text: why });
         }
         rows.push({ t: ev.start, kind: 'event', camera: ev.camera, what: parts.join(', ') || 'detection', recipients });
     }
@@ -565,7 +710,7 @@ async function notificationsReport({ outDir, since, until, cameraFilter }) {
             merged.set(k, m);
         }
         if (merged.size)
-            rows.push({ t: history[i].t, kind: 'settings', camera: [...merged.values()].flatMap(m => m.cameras).join(', '), what: '',
+            rows.push({ t: history[i].t, after: history[i].after, kind: 'settings', camera: [...merged.values()].flatMap(m => m.cameras).join(', '), what: '',
                 recipients: [...merged.values()].map(m => ({ status: 'changed', name: m.cameras.join(', ') || 'all cameras', text: `${m.text} on ${[...m.notifiers].join(', ')}` })) });
     }
 
@@ -577,7 +722,9 @@ async function notificationsReport({ outDir, since, until, cameraFilter }) {
     const c = (code, s) => color ? `\x1b[${code}m${s}\x1b[0m` : s;
     const statusColor = { sent: '32', skipped: '33', changed: '36', error: '31' };
     for (const r of shown) {
-        const head = r.kind === 'settings' ? 'notification settings changed' : `${r.camera}${r.what ? ' — ' + r.what : ''}`;
+        const head = r.kind === 'settings'
+            ? (r.t - r.after > 2000 ? `notification settings changed (sometime between ${fmtClock(r.after)} and ${fmtClock(r.t)})` : 'notification settings changed')
+            : `${r.camera}${r.what ? ' — ' + r.what : ''}`;
         console.log(`${c('1', fmtTime(r.t))}  ${head}`);
         const w = Math.max(...r.recipients.map(x => x.name.length));
         for (const x of r.recipients)
@@ -632,7 +779,7 @@ else if (cmd === 'tail') {
     const jobs = targets.map(t => tail(t, outDir, toStdout, getPorts));
     if (targets.some(t => t.pluginId === '@scrypted/nvr')) {
         console.error(`recording NVR notifier settings changes -> ${path.join(outDir, SETTINGS_FILE)}`);
-        jobs.push(recordNotifierSettings(outDir));
+        jobs.push(recordNotifierSettings(outDir, devices));
     }
     await Promise.all(jobs);
 }
@@ -677,41 +824,6 @@ else if (cmd === 'notifications') {
     const until = parseTime(flag('--until'), Infinity);
     await notificationsReport({ outDir, since, until, cameraFilter: rest[0] });
 }
-else if (cmd === 'migrate') {
-    // One-time move from the old flat names ("Garage Front [72].log", "plugin @scrypted_nvr.log")
-    // to <plugin>/<device>.log. Dry run unless --yes.
-    const outDir = flag('--dir') || path.join(os.homedir(), 'Library', 'Logs', 'Scrypted', 'consoles');
-    const apply = rest.includes('--yes');
-    const devices = await readDevices();
-    const pluginIds = [...new Set(devices.map(d => d.pluginId))];
-    let moved = 0, skipped = 0;
-    for (const name of fs.readdirSync(outDir).filter(n => n.endsWith('.log'))) {
-        let t;
-        const id = name.match(/(?:\[(\d+)\]|_(\d+)_)\.log$/);
-        const plug = name.match(/^plugin (.+)\.log$/);
-        if (id) {
-            const d = devices.find(d => d.id === (id[1] ?? id[2]));
-            if (d) t = { name: d.name, id: d.id, pluginId: d.pluginId, nativeId: d.nativeId };
-        }
-        else if (plug) {
-            const p = pluginIds.find(p => p.replace(/\//g, '_') === plug[1]);
-            if (p) t = { pluginId: p, nativeId: null };
-        }
-        if (!t) { console.log(`skip      ${name}  (no matching plugin/device)`); skipped++; continue; }
-        const src = path.join(outDir, name), dest = path.join(outDir, logFile(t, devices));
-        console.log(`${apply ? 'moved' : 'would move'}  ${name}  ->  ${path.relative(outDir, dest)}`);
-        moved++;
-        if (!apply) continue;
-        fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
-        if (fs.existsSync(dest)) { // new-layout file already started: put the older history first
-            fs.writeFileSync(dest + '.tmp', Buffer.concat([fs.readFileSync(src), fs.readFileSync(dest)]), { mode: 0o600 });
-            fs.renameSync(dest + '.tmp', dest);
-            fs.rmSync(src);
-        }
-        else fs.renameSync(src, dest);
-    }
-    console.error(`${moved} ${apply ? 'moved' : 'to move'}, ${skipped} skipped${apply ? '' : ' (dry run; add --yes to apply). Stop running tails first.'}`);
-}
 else {
     console.log(`usage:
   node scrypted-logs.mjs list
@@ -724,6 +836,5 @@ else {
     which NVR pushes were sent or skipped per device, and why. Needs \`tail nvr\` running beforehand
     (it saves nvr/plugin.log and records notification settings changes); otherwise only Scrypted's
     in-memory console is used, with approximate times and the current settings.
-  node scrypted-logs.mjs migrate [--yes] [--dir <path>]              move old flat log names into <plugin>/<device>.log
 plugins match by id or short name (hikvision, @scrypted/nvr); devices by name, substring, id, or nativeId.`);
 }
