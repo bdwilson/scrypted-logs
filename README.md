@@ -8,7 +8,7 @@ A small command-line tool for reading [Scrypted](https://www.scrypted.app/) plug
 - **dump** a console's in-memory buffer once
 - **notifications**: a timeline of every detection, showing which phones and browsers got a push and, for the rest, why not
 
-It needs no Scrypted login, no `npm install` and no extra dependencies. It's a single file, `scrypted-logs.mjs`, run with Node.
+It needs no Scrypted login, no `npm install` and no other dependencies, not even a database module. It's a single file, `scrypted-logs.mjs`, run with Node.
 
 > It reads **internal, unauthenticated** Scrypted ports. These aren't a supported interface and may change in a future Scrypted release. Tested with Scrypted server **0.147.0** (desktop app, macOS, Apple Silicon). Linux support is newer; see [Linux](#linux).
 
@@ -157,8 +157,8 @@ node scrypted-logs.mjs notifications "garage front" --since "2026-11-15 15:00"
 ```
 
 **How the settings history is recorded.** It's part of the `tail` process. Nothing is installed in or added to Scrypted, and it's designed not to wear your disk. Whenever `nvr` is one of the tail's targets (including `tail --all`), the same process also:
-1. **takes one snapshot at startup** as the baseline. It's a temporary, read-only copy of Scrypted's database (`~/.scrypted/volume/scrypted.db`): the table files are hard-linked and the journal is cloned with APFS copy-on-write, so almost nothing is written. The live database is never opened.
-2. **then only reads.** Every database write lands first in LevelDB's journal file (`000NNN.log`), which Scrypted only ever appends to. Once a second the tail checks the journal's size, a metadata-only `stat` that writes nothing. When it has grown, the tail reads just the newly appended bytes and picks out writes to NVR's notifier devices and per-user **NVR Preferences** devices. It then updates its copy of each device's Default Notifications, its Custom Notifications per camera, and the **AI, Zones & Schedules** filters. Polling is used because macOS file-change notifications proved unreliable for this file. No snapshots and no disk writes, even when Scrypted is writing hundreds of times a minute; in testing it used about 0.1% CPU or less.
+1. **reads the current settings at startup** from Scrypted's database (`~/.scrypted/volume/scrypted.db`), read-only and in place. Nothing is copied or written. See [How it works](#how-it-works).
+2. **then only reads.** Every database write lands first in LevelDB's journal file (`000NNN.log`), which Scrypted only ever appends to. Once a second the tail checks the journal's size, a metadata-only `stat` that writes nothing. When it has grown, the tail reads just the newly appended bytes and picks out writes to NVR's notifier devices and per-user **NVR Preferences** devices. It then updates its copy of each device's Default Notifications, its Custom Notifications per camera, and the **AI, Zones & Schedules** filters. Polling is used because macOS file-change notifications proved unreliable for this file. No copies and no disk writes, even when Scrypted is writing hundreds of times a minute; in testing it used about 0.1% CPU or less.
 3. **appends a line** to `nvr/notifier-settings.jsonl` only when one of those settings changes. `t` is when the write was seen, and `after` is the previous read, so the change happened between the two: within about a second.
 
 If a detection falls inside a change's window and the new settings explain why it was skipped, the report uses them and says so. This mainly matters for history recorded by earlier versions, which in practice only caught changes every 30 seconds; those are shown as "sometime between … and …". History from before filters were recorded is explained using today's filters, and the report says so.
@@ -285,10 +285,7 @@ The tool:
 
 1. finds the main Scrypted process as the one listening on port **10443**, and lists its `127.0.0.1` ports. A Mac uses `lsof`; Linux reads `/proc`.
 2. identifies each reader port. Every console buffer starts with a header line, `plugin version: <pluginId> <version>`. The tool connects with a made-up nativeId (`scrypted-logs-probe`), which makes Scrypted create an empty buffer holding just that header, and reads the plugin ID from it. Writer ports never reply.
-3. gets device names and nativeIds by **copying** `~/.scrypted/volume/scrypted.db` (LevelDB) to a temp folder and reading the copy with the `classic-level` module Scrypted ships. The live database is never opened.
-   - Table files are hard-linked, so they cost nothing.
-   - On a Mac, the rest is cloned with APFS copy-on-write.
-   - On Linux, the rest is copied: a reflink on btrfs or xfs, otherwise a plain copy. If hard links aren't possible, the table files are copied too. That happens when the database belongs to another user, such as root in Docker, or is on another filesystem. That's the whole database, about 35 MB here, once per `list`/`grep`/`notifications` run and once when `tail` starts.
+3. gets device names and settings by **reading** `~/.scrypted/volume/scrypted.db` directly, read-only, with a small built-in LevelDB reader, so no database module or `npm` is needed. Scrypted holds the database's lock, which only matters to programs that open it for writing. The reader goes through the table files (`.ldb`, Snappy-compressed blocks) and the journal (`.log`, recent writes) and keeps the newest value per key. Nothing is copied or written. It takes about 50 ms here, and if a compaction removes a file mid-read, it starts over. It was checked against LevelDB's own library on a live Scrypted database: every key came back identical.
 
 Because ports are looked up by plugin ID each time, the tool survives port changes after restarts.
 
@@ -298,23 +295,15 @@ Because ports are looked up by plugin ID each time, the tool survives port chang
 |---|---|
 | `SCRYPTED_PORT` | `10443`, the HTTPS port used to find the server process |
 | `SCRYPTED_VOLUME` | Found automatically. Linux checks the running server's own setting, then tries `~/.scrypted/volume` and `/server/volume`. |
-| `SCRYPTED_APP_MODULES` | Found automatically: `Scrypted.app` on a Mac, the running server's install or `~/.scrypted/node_modules` on Linux, or `classic-level` installed next to the script |
 | `XDG_STATE_HOME` | Linux: the default log folder is `$XDG_STATE_HOME/scrypted-logs/consoles` (`~/.local/state/...`) |
 
 ### Linux
 
 Run it on the Scrypted machine itself. What it needs depends on how Scrypted is installed.
 
-- **Native install, running as your user.** It should work as is. If it can't find the database module, set `SCRYPTED_APP_MODULES` to the `node_modules` folder that contains `classic-level`. To find it:
-  ```bash
-  find ~/.scrypted -maxdepth 6 -type d -name classic-level
-  ```
+- **Native install, running as your user.** It should work as is.
 - **Scrypted as root or another user, including Docker.** As a normal user, the tool can't see which process owns which port. It then probes every `127.0.0.1` listening port on the machine. Only Scrypted's console ports answer with a `plugin version:` header; anything else just gets one unanswered line and is ignored. It says when it does this. Running it as Scrypted's user (or with `sudo`) skips the probing.
-- **Docker.** The database module lives inside the container, so install it next to the script once, with the npm that comes with Node:
-  ```bash
-  cd ~/code/scrypted-logs && npm install classic-level
-  ```
-  Also point it at the container's volume on the host if it isn't `~/.scrypted/volume`. The official compose file maps `~/.scrypted/volume` to `/server/volume`.
+- **Docker.** Point it at the container's volume on the host if it isn't `~/.scrypted/volume`. The official compose file maps `~/.scrypted/volume` to `/server/volume`.
   ```bash
   export SCRYPTED_VOLUME=/path/to/scrypted/volume
   ```
@@ -336,7 +325,7 @@ Run it on the Scrypted machine itself. What it needs depends on how Scrypted is 
 |---|---|
 | `nothing listening on 10443` | Scrypted isn't running, or uses a different port (set `SCRYPTED_PORT`), or it runs in Docker without host networking (run inside the container). |
 | A plugin shows `not running` in `list` | The plugin is disabled, crashed or still restarting. Scrypted waits about 60 s before restarting a crashed plugin. `tail` waits and connects when it comes back. |
-| `(device list unavailable: …)` | The database copy or `classic-level` couldn't be loaded. Plugin consoles still work; check `SCRYPTED_VOLUME` / `SCRYPTED_APP_MODULES`; on Linux, see [Linux](#linux). |
+| `(device list unavailable: …)` | Scrypted's database couldn't be found or read. Plugin consoles still work. Check `SCRYPTED_VOLUME` and that your user can read it; on Linux, see [Linux](#linux). |
 | Nothing new appears after an action in the UI | That action may not log anything, or it logs to a different console (a plugin vs. a camera). Run `grep` across everything to find where it went. |
 
 ---

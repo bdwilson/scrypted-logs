@@ -23,15 +23,14 @@
 //   "plugin version: <pluginId> <version>". Sending a nativeId that doesn't
 //   exist creates an empty buffer that holds just that header, which tells us
 //   which plugin owns the port. Writer ports never reply.
-// - Device names/nativeIds come from a *copy* of ~/.scrypted/volume/scrypted.db
-//   (LevelDB) read with the classic-level module bundled in Scrypted.app.
+// - Device names/nativeIds come from ~/.scrypted/volume/scrypted.db (LevelDB), read
+//   in place and read-only by a small built-in reader (no database module needed).
 //
 // These are internal, unauthenticated ports: any local process can read them,
 // and console output may contain camera RTSP URLs with passwords. Log files
 // are created owner-only (0600).
 
 import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -145,23 +144,6 @@ function volumeDir() {
     return volumeCache = candidates.find(d => fs.existsSync(path.join(d, 'scrypted.db'))) ?? candidates[0];
 }
 
-// The LevelDB module Scrypted itself ships (classic-level), used to read device names
-function loadClassicLevel() {
-    const { dirs } = serverInfo();
-    const up = d => { const out = []; for (let x = d; x !== path.dirname(x); x = path.dirname(x)) out.push(path.join(x, 'node_modules')); return out; };
-    const candidates = [process.env.SCRYPTED_APP_MODULES,
-        '/Applications/Scrypted.app/Contents/Resources/app/node_modules', // macOS desktop app
-        ...dirs.flatMap(up), // the running server's own install
-        path.join(os.homedir(), '.scrypted', 'node_modules'), // Linux install script / npx
-        path.join(os.homedir(), '.scrypted', 'node_modules', '@scrypted', 'server', 'node_modules'),
-        '/server/node_modules', '/server/node_modules/@scrypted/server/node_modules', // inside the Docker image
-    ].filter(Boolean);
-    const req = createRequire(import.meta.url);
-    for (const c of candidates) if (fs.existsSync(path.join(c, 'classic-level'))) return req(path.join(c, 'classic-level'));
-    try { return req('classic-level'); } // `npm install classic-level` next to this script
-    catch { throw new Error('classic-level (the database module Scrypted ships) not found. Set SCRYPTED_APP_MODULES to the node_modules folder that contains it, or run `npm install classic-level` in this folder'); }
-}
-
 // Connect, send the probe id, return the pluginId from the header (or null for writer/other ports).
 // The first-ever connection with a new id creates the empty buffer but replays nothing,
 // so a miss is retried once; after that the probe buffer exists and answers at once.
@@ -195,23 +177,104 @@ async function discoverPorts() {
     return map;
 }
 
-// Snapshot the DB so we never touch the live, locked one. LevelDB's .ldb table files are
-// immutable, so they're hard-linked (instant, no extra space). The rest, mainly the journal
-// (up to ~4 MB), is cloned with APFS copy-on-write (`cp -c`), which writes no data, so frequent
-// snapshots don't wear the disk; plain copy is the fallback on other filesystems.
-let canClone = IS_MAC;
-function snapshotDb(dest) {
-    const src = path.join(volumeDir(), 'scrypted.db');
-    for (const f of fs.readdirSync(src)) {
-        if (f === 'LOCK') continue;
-        const s = path.join(src, f), d = path.join(dest, f);
-        if (f.endsWith('.ldb')) { try { fs.linkSync(s, d); continue; } catch { } }
-        if (canClone) {
-            try { execFileSync('/bin/cp', ['-c', s, d], { stdio: 'ignore' }); continue; }
-            catch { if (!fs.existsSync(s)) continue; canClone = false; } // gone mid-snapshot, or no clone support
+// ---------- reading Scrypted's database ----------
+// Scrypted keeps its data in LevelDB (~/.scrypted/volume/scrypted.db). Rather than depend on a
+// LevelDB module (and copy the database, since the running server holds its lock), this reads
+// the files directly, read-only, in place:
+// - table files (NNNNNN.ldb / .sst): sorted blocks, usually Snappy-compressed;
+// - journal files (NNNNNN.log): recent writes not yet in a table (see JournalReader).
+// The newest entry (highest sequence number) per key wins; a deletion hides the key.
+
+// Snappy block decompression (format: github.com/google/snappy/blob/main/format_description.txt)
+function snappyDecompress(src) {
+    let pos = 0, len = 0, shift = 0, b;
+    do { b = src[pos++]; len += (b & 0x7f) * 2 ** shift; shift += 7; } while (b & 0x80);
+    const out = Buffer.allocUnsafe(len);
+    let o = 0;
+    while (pos < src.length) {
+        const tag = src[pos++];
+        if ((tag & 3) === 0) { // literal
+            let n = tag >> 2;
+            if (n >= 60) { const bytes = n - 59; n = 0; for (let i = 0; i < bytes; i++) n += src[pos++] * 256 ** i; }
+            n += 1;
+            src.copy(out, o, pos, pos + n);
+            pos += n; o += n;
+            continue;
         }
-        // Linux: a reflink copy where the filesystem supports it (btrfs, xfs), else a plain copy
-        try { fs.copyFileSync(s, d, fs.constants.COPYFILE_FICLONE); } catch (e) { if (e.code !== 'ENOENT') throw e; } // compaction may remove files mid-copy
+        let n, off;
+        if ((tag & 3) === 1) { n = ((tag >> 2) & 7) + 4; off = ((tag >> 5) << 8) | src[pos++]; }
+        else if ((tag & 3) === 2) { n = (tag >> 2) + 1; off = src.readUInt16LE(pos); pos += 2; }
+        else { n = (tag >> 2) + 1; off = src.readUInt32LE(pos); pos += 4; }
+        if (!off || off > o) throw new Error('bad snappy data');
+        for (let i = 0; i < n; i++, o++) out[o] = out[o - off]; // byte by byte: copies may overlap
+    }
+    if (o !== len) throw new Error('bad snappy length');
+    return out;
+}
+
+// One LevelDB table file -> [{key, value|null, seq}] for keys starting with prefix
+function readTable(buf, prefix) {
+    const varint = (b, o) => { let r = 0, s = 0, x; do { x = b[o++]; r += (x & 0x7f) * 2 ** s; s += 7; } while (x & 0x80); return [r, o]; };
+    const handle = (b, o) => { let off, size; [off, o] = varint(b, o); [size, o] = varint(b, o); return [{ off, size }, o]; };
+    const block = h => {
+        const raw = buf.subarray(h.off, h.off + h.size), type = buf[h.off + h.size];
+        if (type === 0) return raw;
+        if (type === 1) return snappyDecompress(raw);
+        throw new Error(`unsupported table compression ${type}`);
+    };
+    // block entries share key prefixes with the entry before; a restart array ends the block
+    const entries = b => {
+        const restarts = b.readUInt32LE(b.length - 4), end = b.length - 4 - 4 * restarts, out = [];
+        let o = 0, key = Buffer.alloc(0);
+        while (o < end) {
+            let shared, unshared, vlen;
+            [shared, o] = varint(b, o); [unshared, o] = varint(b, o); [vlen, o] = varint(b, o);
+            key = Buffer.concat([key.subarray(0, shared), b.subarray(o, o + unshared)]);
+            o += unshared;
+            out.push([key, b.subarray(o, o + vlen)]);
+            o += vlen;
+        }
+        return out;
+    };
+    const footer = buf.subarray(buf.length - 48);
+    if (footer.readBigUInt64LE(40) !== 0xdb4775248b80fb57n) throw new Error('not a LevelDB table');
+    const [, o] = handle(footer, 0); // metaindex (unused)
+    const [index] = handle(footer, o);
+    const pre = Buffer.from(prefix), out = [];
+    for (const [, h] of entries(block(index))) {
+        for (const [ikey, value] of entries(block(handle(h, 0)[0]))) {
+            // internal key = user key + 8 bytes: (sequence << 8) | type (1 value, 0 deletion)
+            const ukey = ikey.subarray(0, ikey.length - 8);
+            if (ukey.length < pre.length || pre.compare(ukey, 0, pre.length) !== 0) continue;
+            const tag = ikey.readBigUInt64LE(ikey.length - 8);
+            out.push({ key: ukey.toString(), value: (tag & 0xffn) === 1n ? value.toString() : null, seq: tag >> 8n });
+        }
+    }
+    return out;
+}
+
+// Current contents of keys under a prefix: {map: Map(key -> value), journal: JournalReader positioned
+// after what was read, so a recorder can follow later writes}. Files that compaction deletes while
+// we read are handled by starting over.
+function readDb(prefix) {
+    const dir = path.join(volumeDir(), 'scrypted.db');
+    for (let attempt = 1; ; attempt++) {
+        try {
+            const all = [];
+            const journal = new JournalReader(dir);
+            for (const f of fs.readdirSync(dir).filter(f => /^\d+\.(ldb|sst)$/.test(f)))
+                all.push(...readTable(fs.readFileSync(path.join(dir, f)), prefix));
+            all.push(...journal.readAll().filter(e => e.key.startsWith(prefix)));
+            const newest = new Map();
+            for (const e of all) { const n = newest.get(e.key); if (!n || e.seq > n.seq) newest.set(e.key, e); }
+            const map = new Map();
+            for (const [k, e] of [...newest].sort((a, b) => a[0] < b[0] ? -1 : 1)) if (e.value !== null) map.set(k, e.value);
+            return { map, journal };
+        }
+        catch (e) {
+            if (e.code === 'ENOENT' && attempt < 5) continue; // a compaction removed a file mid-read
+            throw e;
+        }
     }
 }
 
@@ -287,15 +350,12 @@ function applyDevice(raw, id, d) {
     else if (k?.kind === 'preferences') { raw.prefs[k.user] = compactZones(JSON.parse(d.storage?.cameraNotificationZonesJSON || '{}')); raw.prefIds[id] = k.user; }
 }
 
+// Devices from Scrypted's database. Also returns the journal position, for the settings recorder.
 async function readDevices() {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'scrypted-logs-'));
     try {
-        snapshotDb(tmp);
-        const { ClassicLevel } = loadClassicLevel();
-        const db = new ClassicLevel(tmp, { createIfMissing: false });
-        await db.open();
+        const { map, journal } = readDb('PluginDevice/');
         const devices = [];
-        for await (const [k, v] of db.iterator({ gte: 'PluginDevice/', lt: 'PluginDevice0' })) {
+        for (const [k, v] of map) {
             const d = JSON.parse(v);
             const dev = {
                 id: k.split('/')[1],
@@ -308,15 +368,12 @@ async function readDevices() {
             if (d.pluginId === '@scrypted/objectdetector' && d.nativeId == null) dev.detectionZones = detectionZones(d.storage);
             devices.push(dev);
         }
-        await db.close();
+        Object.defineProperty(devices, 'journal', { value: journal });
         return devices;
     }
     catch (e) {
         console.error(`(device list unavailable: ${e.message})`);
         return [];
-    }
-    finally {
-        fs.rmSync(tmp, { recursive: true, force: true });
     }
 }
 
@@ -549,8 +606,16 @@ const currentNotifierSnapshot = devices => buildSnapshot(rawNotifierSettings(dev
 class JournalReader {
     constructor(dir) { this.dir = dir; this.file = null; this.offset = 0; }
     current() { return fs.readdirSync(this.dir).filter(f => /^\d+\.log$/.test(f)).sort().at(-1) ?? null; }
-    // start at the end of the current journal: everything before is in the baseline snapshot
-    seekToEnd() { this.file = this.current(); this.offset = this.file ? fs.statSync(path.join(this.dir, this.file)).size : 0; }
+    // read the journals from the start (oldest first); later readNew() calls continue where this stopped
+    readAll() {
+        const out = [];
+        for (const f of fs.readdirSync(this.dir).filter(f => /^\d+\.log$/.test(f)).sort()) {
+            this.file = f;
+            this.offset = 0;
+            out.push(...this.#read(f));
+        }
+        return out;
+    }
     // returns [{key, value|null}] for complete batches appended since the last call
     readNew() {
         const out = [];
@@ -585,7 +650,7 @@ class JournalReader {
             frags.push(buf.subarray(pos + 7, pos + 7 + len));
             pos += 7 + len;
             if (type === 1 || type === 4) {
-                entries.push(...JournalReader.#batch(Buffer.concat(frags)));
+                entries.push(...JournalReader.batch(Buffer.concat(frags)));
                 frags = [];
                 batchStart = pos;
             }
@@ -593,12 +658,12 @@ class JournalReader {
         this.offset += batchStart; // resume at the first incomplete batch
         return entries;
     }
-    static #batch(b) {
+    static batch(b) {
         const varint = o => { let r = 0, s = 0, x; do { x = b[o++]; r |= (x & 0x7f) << s; s += 7; } while (x & 0x80); return [r >>> 0, o]; };
         const out = [];
         try {
-            let o = 12;
-            for (let n = b.readUInt32LE(8); n > 0; n--) {
+            let o = 12, seq = b.readBigUInt64LE(0);
+            for (let n = b.readUInt32LE(8); n > 0; n--, seq++) {
                 const tag = b[o++];
                 let len;
                 [len, o] = varint(o);
@@ -606,7 +671,7 @@ class JournalReader {
                 o += len;
                 let value = null;
                 if (tag === 1) { [len, o] = varint(o); value = b.subarray(o, o + len).toString(); o += len; }
-                out.push({ key, value });
+                out.push({ key, value, seq });
             }
         }
         catch { } // a damaged batch is skipped; the next good one still counts
@@ -622,8 +687,9 @@ async function recordNotifierSettings(outDir, devices) {
     // baseline: the snapshot `tail` already took at startup
     const raw = rawNotifierSettings(devices);
     let snap = buildSnapshot(raw);
-    const journal = new JournalReader(dbDir);
-    journal.seekToEnd();
+    // continue the journal from where readDevices() stopped, so no write is missed in between
+    const journal = devices.journal ?? new JournalReader(dbDir);
+    if (!devices.journal) journal.readAll();
     const last = loadSettingsHistory(outDir).at(-1);
     let lastJson = last ? JSON.stringify(last.notifiers) : '';
     const record = (t, after) => {
