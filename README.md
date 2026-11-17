@@ -1,27 +1,45 @@
 # scrypted-logs
 
-A small command-line tool for reading [Scrypted](https://www.scrypted.app/) plugin and camera consoles on a Mac running the Scrypted desktop app. It can:
+A small command-line tool for reading [Scrypted](https://www.scrypted.app/) plugin and camera consoles on the machine running Scrypted: the macOS desktop app, or Linux (native install or Docker). It can:
 
 - **list** every plugin with its current console port, and its devices
 - **tail** chosen plugins or cameras live, to your terminal and to log files, and follow them across restarts
 - **grep** every console Scrypted holds in memory for a keyword or regex
 - **dump** a console's in-memory buffer once
+- **notifications**: a timeline of every detection, showing which phones and browsers got a push and, for the rest, why not
 
 It needs no Scrypted login, no `npm install` and no extra dependencies. It's a single file, `scrypted-logs.mjs`, run with Node.
 
-> It reads **internal, unauthenticated** Scrypted ports. These aren't a supported interface and may change in a future Scrypted release. Tested with Scrypted server **0.147.0** (desktop app, macOS, Apple Silicon).
+> It reads **internal, unauthenticated** Scrypted ports. These aren't a supported interface and may change in a future Scrypted release. Tested with Scrypted server **0.147.0** (desktop app, macOS, Apple Silicon). Linux support is newer; see [Linux](#linux).
+
+## Why see what was suppressed?
+
+Scrypted NVR records every detection, but it only tells you about the notifications it sends. When it skips one, it logs, at most, "Not sending detection. No new detections found, filtered, or snoozed." That doesn't say which reason applied or which device missed out. So when you *didn't* get an alert, you can't easily tell whether something is broken or working as intended.
+
+That matters most when something else changes your notification settings for you. [Scrypted Connect for Hubitat](https://github.com/bdwilson/hubitat/tree/master/Scrypted) is one example. It lets Hubitat mute and unmute Scrypted camera notifications while recording continues. Its Motion Disabler app can mute chosen cameras for a while when a contact, lock, motion or presence event happens. Cameras can also be muted by Home/Away mode, a hub switch, or Rule Machine rules. The idea is that opening the door to walk the dog shouldn't send pushes about you to your own phone. With automations like that, you'll want to know:
+
+- **Did the mute happen in time?** The settings history is timestamped to within about a second. The report shows whether the mute came before or after the detections it was meant to cover.
+- **Did it unmute afterwards?** Later detections either show `sent` or tell you the camera is still muted.
+- **Was a skip the automation, or something else?** Was the type turned off, snoozed, or blocked by an AI, Zones & Schedules filter (a squirrel against "dog, cat, deer")? Was it removed by an Object Detection exclude zone, such as the road? Or did NVR decide a parked car wasn't moving?
+- **Who got what?** Each phone, Mac and browser has its own settings, so one event can be `sent` to one device and `skipped` on another, each with its reason.
+
+The same answers help when tuning filters and zones. You can see the alerts you missed and exactly why, instead of guessing from the timeline.
 
 ---
 
 ## Install
 
-1. **Scrypted desktop app** must be installed and running. See [Desktop App install](https://docs.scrypted.app/install/desktop-app.html) or [Mac terminal install](https://docs.scrypted.app/install/mac-terminal.html).
-2. **Node.js 18 or newer.** With Homebrew:
+1. **Scrypted** must be installed and running on this machine. See [Desktop App install](https://docs.scrypted.app/install/desktop-app.html), [Mac terminal install](https://docs.scrypted.app/install/mac-terminal.html) or [Installation](https://docs.scrypted.app/installation.html) for Linux.
+2. **Node.js 18 or newer.** On a Mac with Homebrew:
    ```bash
    brew install node
    ```
-   Or download it from [nodejs.org](https://nodejs.org/en/download).
-3. **Get the script.** Put this folder anywhere, for example `~/code/scrypted-logs`. Nothing else is needed: it uses Node built-ins, the `lsof` that ships with macOS, and the database library bundled inside `Scrypted.app`.
+   On Linux, use your distribution's package or [NodeSource](https://github.com/nodesource/distributions). You can also download it from [nodejs.org](https://nodejs.org/en/download).
+3. **Get the script.** Clone it anywhere, for example `~/code/scrypted-logs`:
+   ```bash
+   git clone https://github.com/bdwilson/scrypted-logs.git ~/code/scrypted-logs
+   ```
+   Nothing else is needed on a Mac. The script uses Node built-ins, `lsof`, and the database library bundled inside `Scrypted.app`. On Linux, see [Linux](#linux).
 4. **Optional:** add a shell alias so you can run it from anywhere:
    ```bash
    echo 'alias scrypted-logs="node ~/code/scrypted-logs/scrypted-logs.mjs"' >> ~/.zshrc && source ~/.zshrc
@@ -63,9 +81,9 @@ node scrypted-logs.mjs tail --all                     # every plugin and device
 |---|---|
 | `--quiet` | Write files only. This is automatic when output isn't a terminal, e.g. under `nohup` or launchd. |
 | `--stdout` | Always print to the terminal, even when redirected. |
-| `--dir <path>` | Write logs somewhere other than `~/Library/Logs/Scrypted/consoles/`. |
+| `--dir <path>` | Write logs somewhere other than the default: `~/Library/Logs/Scrypted/consoles/` on a Mac, `~/.local/state/scrypted-logs/consoles/` on Linux. |
 
-- Each target gets its own file, in one folder per plugin, with lowercase hyphenated names (no spaces):
+- Each target gets its own file, in one folder per plugin, with lowercase hyphenated names (no spaces). On Linux the folder is `~/.local/state/scrypted-logs/consoles/`:
   ```
   ~/Library/Logs/Scrypted/consoles/
     hikvision/plugin.log          # the plugin's own console
@@ -231,6 +249,27 @@ Unload it:
 launchctl unload ~/Library/LaunchAgents/local.scrypted-logs.plist
 ```
 
+On Linux, a systemd user service does the same. Save this as `~/.config/systemd/user/scrypted-logs.service`, checking the node path with `which node`:
+
+```ini
+[Unit]
+Description=scrypted-logs tail
+
+[Service]
+ExecStart=/usr/bin/node %h/code/scrypted-logs/scrypted-logs.mjs tail nvr objectdetector --quiet
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+Enable it, and let it run without a login session:
+```bash
+systemctl --user enable --now scrypted-logs
+```
+```bash
+sudo loginctl enable-linger $USER
+```
+
 Log files grow without limit, so rotate or delete old ones yourself.
 
 ---
@@ -244,9 +283,12 @@ Scrypted's server runs each plugin in its own process and pipes the plugin's out
 
 The tool:
 
-1. finds the main Scrypted process as the one listening on port **10443**, and lists its `127.0.0.1` ports with `lsof`;
+1. finds the main Scrypted process as the one listening on port **10443**, and lists its `127.0.0.1` ports. A Mac uses `lsof`; Linux reads `/proc`.
 2. identifies each reader port. Every console buffer starts with a header line, `plugin version: <pluginId> <version>`. The tool connects with a made-up nativeId (`scrypted-logs-probe`), which makes Scrypted create an empty buffer holding just that header, and reads the plugin ID from it. Writer ports never reply.
-3. gets device names and nativeIds by **copying** `~/.scrypted/volume/scrypted.db` (LevelDB) to a temp folder and reading the copy with the `classic-level` module bundled in `Scrypted.app`. The live database is never opened.
+3. gets device names and nativeIds by **copying** `~/.scrypted/volume/scrypted.db` (LevelDB) to a temp folder and reading the copy with the `classic-level` module Scrypted ships. The live database is never opened.
+   - Table files are hard-linked, so they cost nothing.
+   - On a Mac, the rest is cloned with APFS copy-on-write.
+   - On Linux, the rest is copied: a reflink on btrfs or xfs, otherwise a plain copy. If hard links aren't possible, the table files are copied too. That happens when the database belongs to another user, such as root in Docker, or is on another filesystem. That's the whole database, about 35 MB here, once per `list`/`grep`/`notifications` run and once when `tail` starts.
 
 Because ports are looked up by plugin ID each time, the tool survives port changes after restarts.
 
@@ -255,8 +297,28 @@ Because ports are looked up by plugin ID each time, the tool survives port chang
 | Variable | Default |
 |---|---|
 | `SCRYPTED_PORT` | `10443`, the HTTPS port used to find the server process |
-| `SCRYPTED_VOLUME` | `~/.scrypted/volume` |
-| `SCRYPTED_APP_MODULES` | `/Applications/Scrypted.app/Contents/Resources/app/node_modules` |
+| `SCRYPTED_VOLUME` | Found automatically. Linux checks the running server's own setting, then tries `~/.scrypted/volume` and `/server/volume`. |
+| `SCRYPTED_APP_MODULES` | Found automatically: `Scrypted.app` on a Mac, the running server's install or `~/.scrypted/node_modules` on Linux, or `classic-level` installed next to the script |
+| `XDG_STATE_HOME` | Linux: the default log folder is `$XDG_STATE_HOME/scrypted-logs/consoles` (`~/.local/state/...`) |
+
+### Linux
+
+Run it on the Scrypted machine itself. What it needs depends on how Scrypted is installed.
+
+- **Native install, running as your user.** It should work as is. If it can't find the database module, set `SCRYPTED_APP_MODULES` to the `node_modules` folder that contains `classic-level`. To find it:
+  ```bash
+  find ~/.scrypted -maxdepth 6 -type d -name classic-level
+  ```
+- **Scrypted as root or another user, including Docker.** As a normal user, the tool can't see which process owns which port. It then probes every `127.0.0.1` listening port on the machine. Only Scrypted's console ports answer with a `plugin version:` header; anything else just gets one unanswered line and is ignored. It says when it does this. Running it as Scrypted's user (or with `sudo`) skips the probing.
+- **Docker.** The database module lives inside the container, so install it next to the script once, with the npm that comes with Node:
+  ```bash
+  cd ~/code/scrypted-logs && npm install classic-level
+  ```
+  Also point it at the container's volume on the host if it isn't `~/.scrypted/volume`. The official compose file maps `~/.scrypted/volume` to `/server/volume`.
+  ```bash
+  export SCRYPTED_VOLUME=/path/to/scrypted/volume
+  ```
+  The database must be readable by your user; otherwise run with `sudo`. If the container doesn't use host networking (the official compose file does), its `127.0.0.1` ports aren't reachable from the host. Run the tool inside the container instead (`docker exec`).
 
 ---
 
@@ -266,15 +328,15 @@ Because ports are looked up by plugin ID each time, the tool survives port chang
 - **Logs can contain secrets**, such as camera RTSP URLs with usernames and passwords. The tool writes files `0600` in a `0700` folder. Be careful before sharing them.
 - **Each probe leaves one empty console entry** named `scrypted-logs-probe` in each plugin's memory. It's a fixed name, so it doesn't grow.
 - **Not a supported interface.** A Scrypted update could change the ports, the header line or the database layout.
-- **macOS only, as tested.** Linux or Docker installs would need different `SCRYPTED_VOLUME` / `SCRYPTED_APP_MODULES` paths and `lsof`. In [cluster mode](https://docs.scrypted.app/maintenance/cluster.html), console ports may bind to the cluster address as well as `127.0.0.1`. This hasn't been tested.
+- **Linux support is newer** than macOS support. Please report problems with your install type. In [cluster mode](https://docs.scrypted.app/maintenance/cluster.html), console ports may bind to the cluster address as well as `127.0.0.1`. This hasn't been tested.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| `nothing listening on 10443` | Scrypted isn't running, or uses a different port. Set `SCRYPTED_PORT`. |
+| `nothing listening on 10443` | Scrypted isn't running, or uses a different port (set `SCRYPTED_PORT`), or it runs in Docker without host networking (run inside the container). |
 | A plugin shows `not running` in `list` | The plugin is disabled, crashed or still restarting. Scrypted waits about 60 s before restarting a crashed plugin. `tail` waits and connects when it comes back. |
-| `(device list unavailable: …)` | The database copy or `classic-level` couldn't be loaded. Plugin consoles still work; check `SCRYPTED_VOLUME` / `SCRYPTED_APP_MODULES`. |
+| `(device list unavailable: …)` | The database copy or `classic-level` couldn't be loaded. Plugin consoles still work; check `SCRYPTED_VOLUME` / `SCRYPTED_APP_MODULES`; on Linux, see [Linux](#linux). |
 | Nothing new appears after an action in the UI | That action may not log anything, or it logs to a different console (a plugin vs. a camera). Run `grep` across everything to find where it went. |
 
 ---

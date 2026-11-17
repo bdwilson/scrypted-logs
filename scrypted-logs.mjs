@@ -38,27 +38,128 @@ import os from 'node:os';
 import path from 'node:path';
 
 const HTTPS_PORT = Number(process.env.SCRYPTED_PORT || 10443);
-const VOLUME = process.env.SCRYPTED_VOLUME || path.join(os.homedir(), '.scrypted', 'volume');
-const APP_MODULES = process.env.SCRYPTED_APP_MODULES || '/Applications/Scrypted.app/Contents/Resources/app/node_modules';
+const IS_MAC = process.platform === 'darwin';
 const PROBE = 'scrypted-logs-probe'; // fixed so repeated probes reuse one empty buffer per plugin
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// where `tail` saves logs and `notifications` reads them
+const LOG_DIR = IS_MAC
+    ? path.join(os.homedir(), 'Library', 'Logs', 'Scrypted', 'consoles')
+    : path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'scrypted-logs', 'consoles');
 
 // ---------- discovery ----------
+// macOS uses lsof. Linux reads /proc directly (lsof is often missing, and as a normal user it
+// can't see a Scrypted that runs as root, e.g. in Docker).
 
 function lsof(args) {
     try { return execFileSync('lsof', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
     catch (e) { return e.stdout || ''; }
 }
 
-function serverPid() {
-    const pid = lsof(['-nP', `-iTCP:${HTTPS_PORT}`, '-sTCP:LISTEN', '-t']).split('\n').find(Boolean);
-    if (!pid) throw new Error(`nothing listening on ${HTTPS_PORT}; is Scrypted running?`);
-    return Number(pid);
+// Linux: listening TCP sockets from /proc/net/tcp{,6} -> [{ip, port, inode}]
+function procListeners() {
+    const out = [];
+    for (const f of ['/proc/net/tcp', '/proc/net/tcp6']) {
+        let text;
+        try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
+        for (const line of text.split('\n').slice(1)) {
+            const c = line.trim().split(/\s+/);
+            if (c.length < 10 || c[3] !== '0A') continue; // 0A = LISTEN
+            const [hex, portHex] = c[1].split(':');
+            const ip = hex.length === 8 ? hex.match(/../g).reverse().map(h => parseInt(h, 16)).join('.')
+                : hex === '0000000000000000FFFF00000100007F' ? '127.0.0.1' // ::ffff:127.0.0.1
+                    : hex === '0'.repeat(32) ? '::' : hex;
+            out.push({ ip, port: parseInt(portHex, 16), inode: c[9] });
+        }
+    }
+    return out;
 }
 
-function localPorts(pid) {
-    return lsof(['-nP', '-a', '-p', String(pid), '-iTCP', '-sTCP:LISTEN', '-Fn'])
-        .split('\n').map(l => l.match(/^n127\.0\.0\.1:(\d+)$/)?.[1]).filter(Boolean).map(Number);
+// Linux: socket inodes a process holds, or null when we may not look (another user's process)
+function procSocketInodes(pid) {
+    try {
+        const out = new Set();
+        for (const fd of fs.readdirSync(`/proc/${pid}/fd`)) {
+            try { const m = fs.readlinkSync(`/proc/${pid}/fd/${fd}`).match(/^socket:\[(\d+)\]$/); if (m) out.add(m[1]); } catch { }
+        }
+        return out;
+    } catch { return null; }
+}
+
+// The Scrypted server process: {pid} when we can see it, {pid: null} when port 10443 is
+// listening but its process isn't visible to us (Linux, Scrypted running as another user).
+let serverCache;
+function findServer() {
+    if (serverCache) return serverCache;
+    if (IS_MAC) {
+        const pid = lsof(['-nP', `-iTCP:${HTTPS_PORT}`, '-sTCP:LISTEN', '-t']).split('\n').find(Boolean);
+        if (!pid) throw new Error(`nothing listening on ${HTTPS_PORT}; is Scrypted running?`);
+        return serverCache = { pid: Number(pid) };
+    }
+    const listener = procListeners().find(l => l.port === HTTPS_PORT);
+    if (!listener) throw new Error(`nothing listening on ${HTTPS_PORT} here; is Scrypted running? `
+        + '(If it runs in Docker without host networking, run this inside the container.)');
+    for (const pid of fs.readdirSync('/proc').filter(d => /^\d+$/.test(d)))
+        if (procSocketInodes(pid)?.has(listener.inode)) return serverCache = { pid: Number(pid) };
+    return serverCache = { pid: null };
+}
+
+// The server's 127.0.0.1 listening ports (its console reader/writer ports are among them).
+let warnedBlind = false;
+function serverLocalPorts() {
+    const { pid } = findServer();
+    if (IS_MAC)
+        return lsof(['-nP', '-a', '-p', String(pid), '-iTCP', '-sTCP:LISTEN', '-Fn'])
+            .split('\n').map(l => l.match(/^n127\.0\.0\.1:(\d+)$/)?.[1]).filter(Boolean).map(Number);
+    const loopback = procListeners().filter(l => l.ip === '127.0.0.1');
+    const mine = pid ? procSocketInodes(pid) : null;
+    if (mine) return loopback.filter(l => mine.has(l.inode)).map(l => l.port);
+    // Scrypted runs as another user (e.g. root in Docker): try every local port; only
+    // Scrypted's console ports answer the probe with a "plugin version:" header.
+    if (!warnedBlind) {
+        warnedBlind = true;
+        console.error(`(Scrypted runs as another user, so checking all ${loopback.length} local ports; run as Scrypted's user or with sudo to skip this)`);
+    }
+    return loopback.map(l => l.port);
+}
+
+// Linux: what the running server tells us about its install (when we may read its /proc entry)
+function serverInfo() {
+    let pid = null;
+    try { pid = findServer().pid; } catch { }
+    const env = {}, dirs = [];
+    if (pid && !IS_MAC) {
+        try { for (const kv of fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0')) { const i = kv.indexOf('='); if (i > 0) env[kv.slice(0, i)] = kv.slice(i + 1); } } catch { }
+        try { dirs.push(fs.readlinkSync(`/proc/${pid}/cwd`)); } catch { }
+        try { dirs.push(...fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(a => a.startsWith('/')).map(a => path.dirname(a))); } catch { }
+    }
+    return { env, dirs };
+}
+
+// Scrypted's data folder (holds scrypted.db)
+let volumeCache;
+function volumeDir() {
+    if (volumeCache) return volumeCache;
+    const { env, dirs } = serverInfo();
+    const candidates = [process.env.SCRYPTED_VOLUME, env.SCRYPTED_VOLUME,
+        path.join(os.homedir(), '.scrypted', 'volume'), '/server/volume', ...dirs.map(d => path.join(d, 'volume'))].filter(Boolean);
+    return volumeCache = candidates.find(d => fs.existsSync(path.join(d, 'scrypted.db'))) ?? candidates[0];
+}
+
+// The LevelDB module Scrypted itself ships (classic-level), used to read device names
+function loadClassicLevel() {
+    const { dirs } = serverInfo();
+    const up = d => { const out = []; for (let x = d; x !== path.dirname(x); x = path.dirname(x)) out.push(path.join(x, 'node_modules')); return out; };
+    const candidates = [process.env.SCRYPTED_APP_MODULES,
+        '/Applications/Scrypted.app/Contents/Resources/app/node_modules', // macOS desktop app
+        ...dirs.flatMap(up), // the running server's own install
+        path.join(os.homedir(), '.scrypted', 'node_modules'), // Linux install script / npx
+        path.join(os.homedir(), '.scrypted', 'node_modules', '@scrypted', 'server', 'node_modules'),
+        '/server/node_modules', '/server/node_modules/@scrypted/server/node_modules', // inside the Docker image
+    ].filter(Boolean);
+    const req = createRequire(import.meta.url);
+    for (const c of candidates) if (fs.existsSync(path.join(c, 'classic-level'))) return req(path.join(c, 'classic-level'));
+    try { return req('classic-level'); } // `npm install classic-level` next to this script
+    catch { throw new Error('classic-level (the database module Scrypted ships) not found. Set SCRYPTED_APP_MODULES to the node_modules folder that contains it, or run `npm install classic-level` in this folder'); }
 }
 
 // Connect, send the probe id, return the pluginId from the header (or null for writer/other ports).
@@ -86,7 +187,7 @@ function probeOnce(port, timeout = 600) {
 }
 
 async function discoverPorts() {
-    const ports = localPorts(serverPid());
+    const ports = serverLocalPorts();
     const results = await Promise.all(ports.map(async p => [p, await probe(p)]));
     const map = new Map(); // pluginId -> reader port
     for (const [port, pluginId] of results)
@@ -98,9 +199,9 @@ async function discoverPorts() {
 // immutable, so they're hard-linked (instant, no extra space). The rest, mainly the journal
 // (up to ~4 MB), is cloned with APFS copy-on-write (`cp -c`), which writes no data, so frequent
 // snapshots don't wear the disk; plain copy is the fallback on other filesystems.
-let canClone = process.platform === 'darwin';
+let canClone = IS_MAC;
 function snapshotDb(dest) {
-    const src = path.join(VOLUME, 'scrypted.db');
+    const src = path.join(volumeDir(), 'scrypted.db');
     for (const f of fs.readdirSync(src)) {
         if (f === 'LOCK') continue;
         const s = path.join(src, f), d = path.join(dest, f);
@@ -109,7 +210,8 @@ function snapshotDb(dest) {
             try { execFileSync('/bin/cp', ['-c', s, d], { stdio: 'ignore' }); continue; }
             catch { if (!fs.existsSync(s)) continue; canClone = false; } // gone mid-snapshot, or no clone support
         }
-        try { fs.copyFileSync(s, d); } catch (e) { if (e.code !== 'ENOENT') throw e; } // compaction may remove files mid-copy
+        // Linux: a reflink copy where the filesystem supports it (btrfs, xfs), else a plain copy
+        try { fs.copyFileSync(s, d, fs.constants.COPYFILE_FICLONE); } catch (e) { if (e.code !== 'ENOENT') throw e; } // compaction may remove files mid-copy
     }
 }
 
@@ -189,7 +291,7 @@ async function readDevices() {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'scrypted-logs-'));
     try {
         snapshotDb(tmp);
-        const { ClassicLevel } = createRequire(import.meta.url)(path.join(APP_MODULES, 'classic-level'));
+        const { ClassicLevel } = loadClassicLevel();
         const db = new ClassicLevel(tmp, { createIfMissing: false });
         await db.open();
         const devices = [];
@@ -515,7 +617,7 @@ class JournalReader {
 async function recordNotifierSettings(outDir, devices) {
     const file = path.join(outDir, SETTINGS_FILE);
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    const dbDir = path.join(VOLUME, 'scrypted.db');
+    const dbDir = path.join(volumeDir(), 'scrypted.db');
 
     // baseline: the snapshot `tail` already took at startup
     const raw = rawNotifierSettings(devices);
@@ -923,7 +1025,7 @@ if (cmd === 'list') {
     console.log(`\nports change on restart; tail by name, e.g.: node scrypted-logs.mjs tail hikvision "Front Porch"`);
 }
 else if (cmd === 'tail') {
-    const outDir = flag('--dir') || path.join(os.homedir(), 'Library', 'Logs', 'Scrypted', 'consoles');
+    const outDir = flag('--dir') || LOG_DIR;
     // echo to the terminal when run interactively; stay quiet under nohup/launchd
     const toStdout = rest.includes('--stdout') || (process.stdout.isTTY && !rest.includes('--quiet'));
     const args = rest.filter(a => a !== '--stdout' && a !== '--quiet');
@@ -986,7 +1088,7 @@ else if (cmd === 'dump') {
     }
 }
 else if (cmd === 'notifications') {
-    const outDir = flag('--dir') || path.join(os.homedir(), 'Library', 'Logs', 'Scrypted', 'consoles');
+    const outDir = flag('--dir') || LOG_DIR;
     const since = parseTime(flag('--since'), Date.now() - 24 * 3600 * 1000);
     const until = parseTime(flag('--until'), Infinity);
     await notificationsReport({ outDir, since, until, cameraFilter: rest[0] });
